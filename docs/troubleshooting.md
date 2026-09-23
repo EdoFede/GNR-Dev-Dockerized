@@ -109,6 +109,18 @@ supervisorctl but no `[unix_http_server]`, so the socket is never created and
 `supervisorctl` cannot reach supervisord — which `gnrdev debug` relies on.
 `docker/supervisor/supervisord.conf` replaces it and adds the section.
 
+## PostgreSQL 18 data path
+
+PostgreSQL 18 expects a single mount at `/var/lib/postgresql` and keeps the
+cluster in a `data` subdirectory; mounting `/var/lib/postgresql/data` directly
+makes it refuse to start with "There appears to be PostgreSQL data in ...
+(unused mount/volume)". The compose file mounts the volume one level up, which
+PostgreSQL 16 also accepts, so existing volumes keep working.
+
+A volume initialised by 16 cannot be read by 18 regardless: upgrading
+`POSTGRES_TAG` on a project with data means `./gnrdev backup`, recreate, then
+`./gnrdev restore`.
+
 ## Notes on the official image
 
 - `GNRLOCAL_PROJECTS` in the official Dockerfile is a typo: the code reads

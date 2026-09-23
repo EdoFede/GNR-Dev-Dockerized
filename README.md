@@ -68,9 +68,9 @@ $ ./gnrdev up sandbox
 $ ./gnrdev new edodevel && ./gnrdev up edodevel
 
 $ ./gnrdev ls
-PROJECT            INSTANCE         PORT   NETWORK        STATUS    DEBUG  URL
-edodevel           edodevel         9001   -              running   -      http://localhost:9001
-sandbox            sandboxpg        9000   -              running   -      http://localhost:9000
+PROJECT            INSTANCE         STATUS    WEB PORT   DEBUG PORT  DB PORT  NETWORK        URL
+edodevel           edodevel         running   9001       -           9201     -              http://localhost:9001
+sandbox            sandboxpg        running   9000       -           9200     -              http://localhost:9000
 ```
 
 Stacks are fully independent: stopping or breaking one leaves the others
@@ -176,26 +176,28 @@ scratch.
 
 ## Ports
 
-Two parallel ranges, same offset per project, so the last digits tie a
-project's web and debug ports together:
+Three parallel ranges, same offset per project, so the last digits tie a
+project's web, debug and database ports together:
 
-| Project | Web | Debug |
-|---|---|---|
-| first | 9000 | 9100 |
-| second | 9001 | 9101 |
-| third | 9002 | 9102 |
+| Project | Web | Debug | Database |
+|---|---|---|---|
+| first | 9000 | 9100 | 9200 |
+| second | 9001 | 9101 | 9201 |
+| third | 9002 | 9102 | 9202 |
 
-Bases are `GNR_PORT_WEB_BASE` / `GNR_PORT_DEBUG_BASE` in `.env`. `new` picks the
-first offset free in *both* ranges, skipping ports already assigned to other
-projects or in use on the host. The values are plain entries in the project's
+Bases are `GNR_PORT_WEB_BASE` / `GNR_PORT_DEBUG_BASE` / `GNR_PORT_DB_BASE` in
+`.env`. `new` picks the first offset free in *all* ranges, skipping ports
+already assigned to other projects or in use on the host. The values are plain entries in the project's
 `.env` and can be edited by hand.
 
 The web port is **identical inside and outside the container** — the server is
 started with `-p ${GNR_PORT_WEB}` and mapped 1:1 — so the URL Genropy logs
 (`Connect at http://127.0.0.1:9000`) is the one that actually works.
 
-`GNR_PORT_DB=0` leaves PostgreSQL unexposed; set a port to reach it with an
-external client.
+PostgreSQL is published so external clients can reach it; `GNR_PORT_DB=0` in a
+project `.env` keeps it unpublished.
+
+The database image defaults to `postgres:18` (`POSTGRES_TAG` per project).
 
 ## Talking between projects
 
@@ -242,9 +244,9 @@ $ ./gnrdev network rm gnrdev          # detach projects first
 `gnrdev ls` also shows each project's network:
 
 ```
-PROJECT            INSTANCE         PORT   NETWORK        STATUS    DEBUG  URL
-edodevel           edodevel         9001   gnrdev         running   -      http://localhost:9001
-sandbox            sandboxpg        9000   gnrdev         running   -      http://localhost:9000
+PROJECT            INSTANCE         STATUS    WEB PORT   DEBUG PORT  DB PORT  NETWORK        URL
+edodevel           edodevel         running   9001       -           9201     gnrdev         http://localhost:9001
+sandbox            sandboxpg        running   9000       -           9200     gnrdev         http://localhost:9000
 ```
 
 Leaving `GNR_NETWORK` empty keeps a project isolated.

@@ -69,9 +69,9 @@ $ ./gnrdev up sandbox
 $ ./gnrdev new edodevel && ./gnrdev up edodevel
 
 $ ./gnrdev ls
-PROJECT            INSTANCE         PORT   NETWORK        STATUS    DEBUG  URL
-edodevel           edodevel         9001   -              running   -      http://localhost:9001
-sandbox            sandboxpg        9000   -              running   -      http://localhost:9000
+PROJECT            INSTANCE         STATUS    WEB PORT   DEBUG PORT  DB PORT  NETWORK        URL
+edodevel           edodevel         running   9001       -           9201     -              http://localhost:9001
+sandbox            sandboxpg        running   9000       -           9200     -              http://localhost:9000
 ```
 
 Gli stack sono del tutto indipendenti: fermarne o romperne uno non tocca gli
@@ -178,18 +178,18 @@ Con `--keep-env` la configurazione sopravvive e `up` ricrea lo stack da zero.
 
 ## Porte
 
-Due range paralleli, stesso offset per progetto, cosi' le ultime cifre legano
-la porta web e quella di debug dello stesso progetto:
+Tre range paralleli, stesso offset per progetto, cosi' le ultime cifre legano
+le porte web, debug e database dello stesso progetto:
 
-| Progetto | Web | Debug |
-|---|---|---|
-| primo | 9000 | 9100 |
-| secondo | 9001 | 9101 |
-| terzo | 9002 | 9102 |
+| Progetto | Web | Debug | Database |
+|---|---|---|---|
+| primo | 9000 | 9100 | 9200 |
+| secondo | 9001 | 9101 | 9201 |
+| terzo | 9002 | 9102 | 9202 |
 
-Le basi sono `GNR_PORT_WEB_BASE` / `GNR_PORT_DEBUG_BASE` in `.env`. `new`
-sceglie il primo offset libero in *entrambi* i range, saltando le porte gia'
-assegnate ad altri progetti o occupate sull'host. Sono valori ordinari nel
+Le basi sono `GNR_PORT_WEB_BASE` / `GNR_PORT_DEBUG_BASE` / `GNR_PORT_DB_BASE` in
+`.env`. `new` sceglie il primo offset libero in *tutti* i range, saltando le
+porte gia' assegnate ad altri progetti o occupate sull'host. Sono valori ordinari nel
 `.env` del progetto e si possono modificare a mano.
 
 La porta web e' **identica dentro e fuori dal container** — il server viene
@@ -197,8 +197,11 @@ avviato con `-p ${GNR_PORT_WEB}` e mappato 1:1 — quindi l'URL che Genropy
 scrive nei log (`Connect at http://127.0.0.1:9000`) e' quello che funziona
 davvero.
 
-`GNR_PORT_DB=0` lascia PostgreSQL non esposto; imposta una porta per
-raggiungerlo con un client esterno.
+PostgreSQL viene pubblicato per essere raggiungibile da client esterni; con
+`GNR_PORT_DB=0` nel `.env` del progetto resta non pubblicato.
+
+L'immagine del database e' `postgres:18` di default (`POSTGRES_TAG` per
+progetto).
 
 ## Far dialogare i progetti
 
@@ -245,9 +248,9 @@ $ ./gnrdev network rm gnrdev          # stacca prima i progetti
 Anche `gnrdev ls` mostra la rete di ogni progetto:
 
 ```
-PROJECT            INSTANCE         PORT   NETWORK        STATUS    DEBUG  URL
-edodevel           edodevel         9001   gnrdev         running   -      http://localhost:9001
-sandbox            sandboxpg        9000   gnrdev         running   -      http://localhost:9000
+PROJECT            INSTANCE         STATUS    WEB PORT   DEBUG PORT  DB PORT  NETWORK        URL
+edodevel           edodevel         running   9001       -           9201     gnrdev         http://localhost:9001
+sandbox            sandboxpg        running   9000       -           9200     gnrdev         http://localhost:9000
 ```
 
 Lasciare `GNR_NETWORK` vuoto mantiene il progetto isolato.

@@ -144,6 +144,11 @@ dc() {
     if [ "${USE_FRAMEWORK_SRC:-0}" = "1" ]; then
         files+=(-f compose.framework.yaml)
     fi
+    # GNR_PORT_DB=0 means "do not publish": the mapping has to be dropped,
+    # since Docker reads port 0 as "pick a random host port".
+    if [ "$(env_get "$p" GNR_PORT_DB)" = "0" ]; then
+        files+=(-f compose.nodb.yaml)
+    fi
     # The shared-network override only applies when a network is in effect.
     local net; net=$(net_for "$p")
     if [ -n "$net" ]; then
@@ -158,34 +163,36 @@ dc() {
 }
 
 # ---------------------------------------------------------------- port allocation
-# Two parallel ranges with a fixed offset: the last digits tie a project's web
-# port to its debug port.
+# Three parallel ranges with a fixed offset: the last digits tie a project's
+# web, debug and database ports together.
 #
 #   web    9000, 9001, 9002, ...   (GNR_PORT_WEB_BASE)
 #   debug  9100, 9101, 9102, ...   (GNR_PORT_DEBUG_BASE)
+#   db     9200, 9201, 9202, ...   (GNR_PORT_DB_BASE)
 #
-# We look for a slot (the offset from the base) free in BOTH ranges, so the
-# pairing holds even when one of the two ports is taken.
+# We look for a slot (the offset from the base) free in ALL ranges, so the
+# pairing holds even when one of the ports is taken.
 port_in_use() {
     local port="$1"
+    [ "$port" = "0" ] && return 1          # 0 means "do not publish"
     grep -qsh "^GNR_PORT_\(WEB\|DEBUG\|DB\)=${port}$" projects/*.env 2>/dev/null && return 0
     lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && return 0
     return 1
 }
 
-# Prints "<web_port> <debug_port>" for the first slot free in both ranges.
+# Prints "<web_port> <debug_port> <db_port>" for the first slot free in all ranges.
 next_free_slot() {
-    local web_base="$1" debug_base="$2"
+    local web_base="$1" debug_base="$2" db_base="$3"
     local slot=0
     while [ "$slot" -lt 100 ]; do
-        local web=$((web_base + slot)) dbg=$((debug_base + slot))
-        if ! port_in_use "$web" && ! port_in_use "$dbg"; then
-            echo "$web $dbg"
+        local web=$((web_base + slot)) dbg=$((debug_base + slot)) db=$((db_base + slot))
+        if ! port_in_use "$web" && ! port_in_use "$dbg" && ! port_in_use "$db"; then
+            echo "$web $dbg $db"
             return 0
         fi
         slot=$((slot + 1))
     done
-    err "no free slot in ranges ${web_base}+ / ${debug_base}+"
+    err "no free slot in ranges ${web_base}+ / ${debug_base}+ / ${db_base}+"
 }
 
 # ---------------------------------------------------------------- commands
@@ -232,13 +239,15 @@ cmd_new() {
         [ -n "$instance" ] || instance="$project"
     fi
 
-    local web debug
-    read -r web debug <<< "$(next_free_slot "${GNR_PORT_WEB_BASE:-9000}" "${GNR_PORT_DEBUG_BASE:-9100}")"
+    local web debug dbport
+    read -r web debug dbport <<< "$(next_free_slot \
+        "${GNR_PORT_WEB_BASE:-9000}" "${GNR_PORT_DEBUG_BASE:-9100}" "${GNR_PORT_DB_BASE:-9200}")"
 
     sed -e "s/__PROJECT__/${project}/g" \
         -e "s/__INSTANCE__/${instance}/g" \
         -e "s/__PORT_WEB__/${web}/g" \
         -e "s/__PORT_DEBUG__/${debug}/g" \
+        -e "s/__PORT_DB__/${dbport}/g" \
         projects/_template.env > "$target"
 
     if [ -n "$network" ]; then
@@ -256,6 +265,7 @@ cmd_new() {
     echo "    instance : ${instance}"
     echo "    web      : http://localhost:${web}"
     echo "    debugpy  : ${debug}"
+    echo "    database : ${dbport}"
     [ -n "$network" ] && echo "    network  : ${network}"
     echo
     echo "Review ${target} (GNR_MAINPACKAGE, GNR_DEP_PROJECTS), then: ./gnrdev up ${project}"
@@ -701,19 +711,22 @@ cmd_ls() {
     shopt -s nullglob
     local files=(projects/*.env)
     [ ${#files[@]} -eq 0 ] && { echo "no project configured — run ./gnrdev new <project>"; return; }
-    printf "%-18s %-16s %-6s %-14s %-9s %-6s %s\n" \
-        PROJECT INSTANCE PORT NETWORK STATUS DEBUG URL
+    printf "%-18s %-16s %-9s %-10s %-11s %-8s %-14s %s\n" \
+        PROJECT INSTANCE STATUS "WEB PORT" "DEBUG PORT" "DB PORT" NETWORK URL
     for f in "${files[@]}"; do
         [ "$(basename "$f")" = "_template.env" ] && continue
-        local p i w nt st dbg
+        local p i w dbp nt st dbg
         p=$(grep '^GNR_PROJECT=' "$f" | cut -d= -f2)
         i=$(grep '^GNR_INSTANCE=' "$f" | cut -d= -f2)
         w=$(grep '^GNR_PORT_WEB=' "$f" | cut -d= -f2)
+        # 0 or unset means the database port is not published
+        dbp=$(grep '^GNR_PORT_DB=' "$f" 2>/dev/null | cut -d= -f2 | tail -1)
+        { [ -n "$dbp" ] && [ "$dbp" != "0" ]; } || dbp="-"
         nt=$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1)
         [ -n "$nt" ] || nt="-"
         # Pad the plain word first, then colour it: escape sequences have no
         # width, so padding a coloured string would misalign the columns.
-        dbg="$(printf '%-6s' '-')"
+        dbg="$(printf '%-11s' '-')"
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^gnr-${p}-app$"; then
             st="${c_grn}$(printf '%-9s' running)${c_off}"
             # Debug mode leaves a `gnr web serve ... --debugpy` running outside
@@ -727,12 +740,13 @@ cmd_ls() {
                     esac
                   done; exit 1' 2>/dev/null; then
                 local dport; dport=$(grep '^GNR_PORT_DEBUG=' "$f" 2>/dev/null | cut -d= -f2)
-                dbg="${c_mag}$(printf '%-6s' "${dport:-on}")${c_off}"
+                dbg="${c_mag}$(printf '%-11s' "${dport:-on}")${c_off}"
             fi
         else
             st="${c_dim}$(printf '%-9s' stopped)${c_off}"
         fi
-        printf "%-18s %-16s %-6s %-14s %s %s %s\n" "$p" "$i" "$w" "$nt" "$st" "$dbg" "http://localhost:${w}"
+        printf "%-18s %-16s %s %-10s %s %-8s %-14s %s\n" \
+            "$p" "$i" "$st" "$w" "$dbg" "$dbp" "$nt" "http://localhost:${w}"
     done
 }
 

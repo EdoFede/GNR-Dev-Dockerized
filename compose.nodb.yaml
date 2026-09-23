@@ -1,0 +1,8 @@
+# Applied by gnrdev when the project sets GNR_PORT_DB=0.
+#
+# Docker reads "0:5432" as "any free host port", so the mapping has to be
+# dropped entirely rather than set to zero.
+
+services:
+  db:
+    ports: !reset []

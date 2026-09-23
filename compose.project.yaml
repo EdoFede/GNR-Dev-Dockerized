@@ -10,7 +10,7 @@ name: gnr-${GNR_PROJECT}
 
 services:
   db:
-    image: postgres:${POSTGRES_TAG:-16}
+    image: postgres:${POSTGRES_TAG:-18}
     container_name: gnr-${GNR_PROJECT}-db
     hostname: gnr-${GNR_PROJECT}-db
     environment:
@@ -18,10 +18,15 @@ services:
       POSTGRES_PASSWORD: ${GNR_DB_PASSWORD:-genro}
       POSTGRES_DB: ${GNR_DB_NAME}
     volumes:
-      - pgdata:/var/lib/postgresql/data
-    # Optional: only needed to connect with an external client.
+      # PostgreSQL 18+ wants a single mount at /var/lib/postgresql and keeps the
+      # data in a subdirectory; mounting .../data directly makes it refuse to
+      # start. Existing volumes created for 16 are not readable by 18: see
+      # docs/troubleshooting.md.
+      - pgdata:/var/lib/postgresql
     ports:
-      - "${GNR_PORT_DB:-0}:5432"
+      # Published so external clients can reach it. Set GNR_PORT_DB=0 in the
+      # project .env to keep it unpublished.
+      - "${GNR_PORT_DB:-9200}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${GNR_DB_USER:-genro} -d ${GNR_DB_NAME}"]
       interval: 5s
