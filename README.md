@@ -321,9 +321,13 @@ To work on the framework itself, or to use a specific branch/commit:
 ```
 
 This mounts the checkout at `HOST_GENROPY`, optionally moved to
-`GNR_FRAMEWORK_REF`, and installs it editable — framework edits take effect
-immediately. It also gives you the dojo versions missing from the official
-image.
+`GNR_FRAMEWORK_REF`, and installs it editable with the `[developer,pgsql]`
+profiles from the installation guide — framework edits take effect immediately.
+It also gives you the dojo versions missing from the official image.
+
+It builds a separate image (tagged `:fwsrc`) with the framework removed from
+`site-packages`, which would otherwise shadow the mounted checkout. The
+entrypoint verifies the checkout is really in use and fails if it is not.
 
 ## Cross-project dependencies
 

@@ -327,9 +327,15 @@ Per lavorare sul framework stesso, o per usare un branch/commit specifico:
 ```
 
 Monta il checkout indicato da `HOST_GENROPY`, opzionalmente posizionato su
-`GNR_FRAMEWORK_REF`, e lo installa in editable mode: le modifiche al framework
+`GNR_FRAMEWORK_REF`, e lo installa in editable mode con i profili
+`[developer,pgsql]` della guida di installazione: le modifiche al framework
 hanno effetto immediato. Da' accesso anche alle versioni di dojo assenti
 nell'immagine ufficiale.
+
+Costruisce un'immagine separata (tag `:fwsrc`) con il framework rimosso da
+`site-packages`, che altrimenti avrebbe la precedenza sul checkout montato.
+L'entrypoint verifica che il checkout sia davvero in uso e fallisce in caso
+contrario.
 
 ## Dipendenze cross-progetto
 

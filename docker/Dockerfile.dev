@@ -45,6 +45,16 @@ RUN pip install --no-cache-dir watchdog uv
 COPY docker/polling_observer.py /usr/local/lib/python3.11/site-packages/zz_gnrdev_polling.py
 RUN echo "import zz_gnrdev_polling" > /usr/local/lib/python3.11/site-packages/zz_gnrdev_polling.pth
 
+# With --framework-src the framework comes from a bind-mounted checkout. The
+# copy the official image installs into site-packages would shadow it, because
+# that path is searched before the editable finder, so it is dropped here: at
+# build time we are still root, at runtime the genro user cannot write there.
+ARG FRAMEWORK_FROM_SRC=0
+RUN if [ "$FRAMEWORK_FROM_SRC" = "1" ]; then \
+        rm -rf /usr/local/lib/python3.11/site-packages/gnr \
+               /usr/local/lib/python3.11/site-packages/genropy-*.dist-info; \
+    fi
+
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/supervisor/app.conf /etc/supervisor/conf.d/app.conf
 COPY docker/supervisor/supervisord.conf /etc/supervisor/supervisord.conf

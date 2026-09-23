@@ -66,22 +66,43 @@ if [ "${GNR_SKIP_CHECKDEP:-0}" != "1" ]; then
 fi
 
 # --- 3b. editable framework (only with --framework-src) -------------------------
-# The image installs gnrpy non-editable, so without this Python would ignore the
-# mounted checkout.
+# The image ships gnr/ inside /usr/local/.../site-packages. That copy comes
+# FIRST on sys.path, so an editable install alone is not enough: pip would
+# report the checkout while `import gnr` still loads the image copy. The
+# directory has to go.
+#
+# Profiles follow the installation guide: [developer,pgsql]. --no-deps is not
+# used, so the extras resolve; the heavy native deps are already in the image
+# and pip leaves them alone.
+FW_SRC=/home/genro/genropy/gnrpy
 if [ "${GNR_FRAMEWORK_EDITABLE:-0}" = "1" ]; then
-    if [ -f /home/genro/genropy/gnrpy/pyproject.toml ]; then
-        STAMP_FW="/home/genro/.local/.fw-editable"
-        if [ ! -f "${STAMP_FW}" ]; then
-            log "installing the framework editable from the mounted checkout"
-            pip install --user --quiet --no-deps -e /home/genro/genropy/gnrpy \
-                && touch "${STAMP_FW}" \
-                || log "WARNING: editable install failed, using the image framework"
+    if [ ! -f "${FW_SRC}/pyproject.toml" ]; then
+        fail "GNR_FRAMEWORK_EDITABLE=1 but ${FW_SRC}/pyproject.toml is missing (check HOST_GENROPY)"
+    fi
+    # The image copy of gnr/ is removed at build time (see Dockerfile.dev):
+    # site-packages is not writable by the genro user, so it cannot be done here.
+
+    # Stamped on the checkout path: a different mount must reinstall.
+    STAMP_FW="/home/genro/.local/.fw-editable"
+    want="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$FW_SRC")"
+    if [ "$(cat "${STAMP_FW}" 2>/dev/null || true)" != "$want" ]; then
+        log "installing the framework editable from the mounted checkout"
+        if pip install --user --quiet -e "${FW_SRC}[developer,pgsql]"; then
+            mkdir -p "$(dirname "${STAMP_FW}")" && echo "$want" > "${STAMP_FW}"
         else
-            log "framework already editable"
+            fail "editable install of the framework failed"
         fi
     else
-        log "WARNING: GNR_FRAMEWORK_EDITABLE=1 but gnrpy/pyproject.toml is not in the mount"
+        log "framework already editable"
     fi
+
+    # Verify it actually took: pip can report the checkout while the import
+    # still resolves elsewhere.
+    actual=$(python3 -c 'import gnr,os;print(os.path.realpath(os.path.dirname(gnr.__file__)))' 2>/dev/null || true)
+    case "$actual" in
+        /home/genro/genropy/*) log "framework in use: ${actual}" ;;
+        *) fail "framework still loaded from ${actual:-unknown}, not from the mounted checkout" ;;
+    esac
 fi
 
 # --- 4. fail fast on missing placeholders ---------------------------------------

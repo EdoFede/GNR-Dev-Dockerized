@@ -128,6 +128,13 @@ env_get() {
     grep "^${2}=" "$(env_file_for "$1")" 2>/dev/null | cut -d= -f2- | tail -1
 }
 
+# `docker compose exec` allocates a TTY unless -T is given, and without one the
+# tools inside the container drop their colours. We only disable it when stdout
+# is not a terminal, where a TTY would add stray \r and fail outright.
+exec_tty_flag() {
+    [ -t 1 ] || printf -- '-T'
+}
+
 # docker compose with the right files and variables
 # The network in effect: the one forced with `up --network` wins over the .env.
 net_for() {
@@ -359,7 +366,8 @@ cmd_rebuild() { local p="${1:?usage: ./gnrdev rebuild <project>}"; dc "$p" build
 
 cmd_gnr() {
     local p="${1:?usage: ./gnrdev gnr <project> <args...>}"; shift
-    dc "$p" exec app gnr "$@"
+    local t; t=$(exec_tty_flag)
+    dc "$p" exec ${t:+$t} app gnr "$@"
 }
 
 cmd_psql() {
@@ -391,10 +399,11 @@ db_cmd() {
     local p="$1"; local mode="$2"
     local ef; ef=$(env_file_for "$p")
     local inst; inst=$(grep '^GNR_INSTANCE=' "$ef" | cut -d= -f2)
+    local t; t=$(exec_tty_flag)
     if [ "$mode" = "check" ]; then
-        dc "$p" exec -T app gnr db migrate -c -v "$inst"
+        dc "$p" exec ${t:+$t} app gnr db migrate -c -v "$inst"
     else
-        dc "$p" exec -T app gnr db migrate -u "$inst"
+        dc "$p" exec ${t:+$t} app gnr db migrate -u "$inst"
     fi
 }
 

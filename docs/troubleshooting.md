@@ -121,6 +121,31 @@ A volume initialised by 16 cannot be read by 18 regardless: upgrading
 `POSTGRES_TAG` on a project with data means `./gnrdev backup`, recreate, then
 `./gnrdev restore`.
 
+## --framework-src and the image copy of gnr
+
+The official image installs the framework into
+`/usr/local/lib/python3.11/site-packages/gnr`, non-editable. That path is
+searched before the editable finder, so an editable install of the mounted
+checkout is not enough: `pip list` reports the checkout while `import gnr` still
+loads the image copy — silently, with framework edits having no effect.
+
+The directory is therefore removed at **build time** (`FRAMEWORK_FROM_SRC=1` in
+`Dockerfile.dev`), since `site-packages` is not writable by the `genro` user at
+runtime. `compose.framework.yaml` tags that image `:fwsrc` so projects in normal
+mode never reuse it.
+
+The install follows the installation guide profiles:
+`pip install --user -e <checkout>/gnrpy[developer,pgsql]`. The entrypoint then
+verifies that `import gnr` really resolves inside the checkout and fails loudly
+if it does not.
+
+## Colours through `docker compose exec`
+
+`exec -T` gives the command no TTY, and the tools inside the container then drop
+their colours. `gnrdev` passes `-T` only when its own stdout is not a terminal
+(`exec_tty_flag`), so colours survive interactive use while redirected output
+stays clean and scripted runs do not fail with "the input device is not a TTY".
+
 ## Notes on the official image
 
 - `GNRLOCAL_PROJECTS` in the official Dockerfile is a typo: the code reads

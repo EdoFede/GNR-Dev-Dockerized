@@ -30,6 +30,12 @@ services:
         git -C /src rev-parse --short HEAD
 
   app:
+    # Separate tag: this image has the framework removed from site-packages and
+    # must not be reused by projects running in normal mode.
+    image: gnrdev/${GNR_PROJECT}:fwsrc
+    build:
+      args:
+        FRAMEWORK_FROM_SRC: "1"
     depends_on:
       db:
         condition: service_healthy
