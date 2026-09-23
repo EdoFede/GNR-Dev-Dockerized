@@ -1,6 +1,6 @@
-# Genropy dockerized dev environment
+# GenroPy Dev Dockerized
 
-_Genropy runtime in containers, sources on the host._
+_A Dockerized development environment for Genropy projects_
 
 [![Italiano](https://img.shields.io/badge/lang-Italiano-1f6feb?style=flat-square)](README.it.md)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[![License](https://img.shields.io/badge/license-Apache--2.0-6f42c1?style=flat-square)](LICENSE)&nbsp;![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-0aa344?style=flat-square)&nbsp;![Arch](https://img.shields.io/badge/arch-arm64%20%7C%20amd64-fd7e14?style=flat-square)&nbsp;![DB](https://img.shields.io/badge/db-PostgreSQL-336791?style=flat-square)
 
