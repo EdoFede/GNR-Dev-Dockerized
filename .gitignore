@@ -116,16 +116,6 @@ config.ini
 
 
 # ==========================================
-# Genropy generic dynamic data
-# ==========================================
-instances/*/site/_static
-instances/*/site/data
-sites/*/_static
-sites/*/data
-maintenance/backups
-
-
-# ==========================================
 # Project-specific
 # ==========================================
 
