@@ -1,0 +1,137 @@
+# Genropy .gitignore template file
+
+# ==========================================
+# OS Files
+# ==========================================
+# macOS
+.DS_Store
+._*
+
+# Windows
+Thumbs.db
+*.lnk
+
+# Linux
+*~
+.directory
+
+
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+local_*.py
+*.egg-info/
+.coverage
+.env
+.venv
+venv/
+.mypy_cache/
+TEST*.xml
+
+
+# ==========================================
+# JavaScript
+# ==========================================
+node_modules/
+npm-debug.log*
+.npm
+.cache
+dist/
+.env.local
+
+
+# ==========================================
+# IDEs config & temp files
+# ==========================================
+# VS Code
+.vscode/
+.history/
+
+# Jupyter Notebook
+*.ipynb
+
+# JetBrains
+.idea/
+
+# Emacs
+\#*\#
+*.elc
+.dir-locals.el
+.projectile
+
+# Vim
+*.swp
+*.swo
+Session.vim
+
+# Sublime Text
+*.sublime-workspace
+
+# Eclipse
+.metadata
+.settings/
+
+
+# ==========================================
+# AI tools
+# ==========================================
+.claude/
+.claude.json
+CLAUDE-UserPref.md
+.qodo/
+
+
+# ==========================================
+# Certificates
+# ==========================================
+*.pem
+*.key
+*.cert
+
+
+# ==========================================
+# Miscellaneous
+# ==========================================
+*.bak
+*.class
+*.db
+*.jar
+*.log
+*.sqlite
+*.tmp
+config.ini
+
+# Large media files
+*.mp4
+*.tiff
+*.avi
+*.flv
+*.mov
+*.wmv
+
+
+# ==========================================
+# Genropy generic dynamic data
+# ==========================================
+instances/*/site/_static
+instances/*/site/data
+sites/*/_static
+sites/*/data
+maintenance/backups
+
+
+# ==========================================
+# Project-specific
+# ==========================================
+
+# Local projects env files
+projects/*.env
+!projects/_template.env
+
+# DB dumps
+backups/
