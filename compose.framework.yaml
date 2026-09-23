@@ -1,0 +1,49 @@
+# Optional override: run the framework from a GIT CHECKOUT instead of the image.
+#
+#   ./gnrdev up <project> --framework-src
+#
+# For working on the framework itself, pinning a branch/commit, or using the
+# dojo versions missing from the official image.
+#
+# The `framework-src` service moves HOST_GENROPY to GNR_FRAMEWORK_REF (when set),
+# then it is mounted over /home/genro/genropy and installed editable.
+
+services:
+  framework-src:
+    image: alpine/git:latest
+    container_name: gnr-${GNR_PROJECT}-fwsrc
+    volumes:
+      - ${HOST_GENROPY}:/src
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ -n "${GNR_FRAMEWORK_REF:-}" ]; then
+          echo "[framework-src] checking out ${GNR_FRAMEWORK_REF}"
+          cd /src
+          git fetch --all --tags
+          git checkout "${GNR_FRAMEWORK_REF}"
+        else
+          echo "[framework-src] no ref requested, using the current checkout"
+        fi
+        git -C /src rev-parse --short HEAD
+
+  app:
+    depends_on:
+      db:
+        condition: service_healthy
+      init-perms:
+        condition: service_completed_successfully
+      framework-src:
+        condition: service_completed_successfully
+    volumes:
+      - ./gnrfolder:/home/genro/.gnr:ro
+      - ${HOST_PROJECTS}:/home/genro/genropy_projects
+      - ${HOST_GNREXTRA}:/home/genro/gnrextra_projects
+      - ${HOST_GENROPY}:/home/genro/genropy
+      - pylibs:/home/genro/.local
+    environment:
+      # Read by the entrypoint: reinstalls gnrpy editable from the bind mount
+      # (--no-deps, the native deps are already in the image).
+      GNR_FRAMEWORK_EDITABLE: "1"

@@ -1,0 +1,760 @@
+#!/usr/bin/env bash
+# Wrapper for the dockerized Genropy dev environment.
+# Run ./gnrdev without arguments for the command list.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+# Colours only when stdout is a terminal: redirected output stays clean.
+# NO_COLOR is honoured (https://no-color.org). The $'...' form needs bash,
+# which the shebang guarantees regardless of the caller's shell.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
+    c_cyan=$'\033[36m'; c_mag=$'\033[35m'
+    c_blue=$'\033[34m'; c_teal=$'\033[96m'
+    c_dim=$'\033[2m';  c_bold=$'\033[1m'; c_off=$'\033[0m'
+else
+    c_red=''; c_grn=''; c_ylw=''; c_cyan=''; c_mag=''; c_blue=''; c_teal=''
+    c_dim=''; c_bold=''; c_off=''
+fi
+err() { echo "${c_red}error:${c_off} $*" >&2; exit 1; }
+info() { echo "${c_grn}==>${c_off} $*"; }
+warn() { echo "${c_ylw}warning:${c_off} $*" >&2; }
+
+[ -f .env ] || err ".env is missing — copy it from .env.example and adjust the paths"
+
+# Renders one help line. The command is lowercase bold green; each placeholder
+# is coloured by what it means, not by whether it is optional:
+#   <project>            cyan
+#   [instance] [.svc]    magenta
+#   <file> [file] [-f]   yellow
+#   <create|rm|list>     blue
+#   <args...>            bright cyan
+# The command column is padded before colouring: escape sequences have no
+# width and would otherwise break the alignment.
+help_line() {
+    local cmd="$1" args="${2:-}" desc="$3"
+    local shown="${cmd}${args:+ }${args}"
+    local pad=$(( 30 - ${#shown} ))
+    [ "$pad" -lt 1 ] && pad=1
+    local coloured="${c_bold}${c_grn}${cmd}${c_off}"
+    if [ -n "$args" ]; then
+        local a="$args"
+        if [ -n "${c_off}" ]; then
+            # One pass over the tokens: colouring each group with its own sed
+            # would make later calls match the brackets inside earlier escapes.
+            a=$(printf '%s' "$a" | awk '{
+                out=""
+                while (match($0, /<[^>]*>|\[[^]]*\]/)) {
+                    out = out substr($0, 1, RSTART-1)
+                    tok = substr($0, RSTART, RLENGTH)
+                    if      (tok ~ /project/)            col="36"
+                    else if (tok ~ /instance|svc/)       col="35"
+                    else if (tok ~ /file|-f/)            col="33"
+                    else if (tok ~ /\|/)                 col="34"
+                    else if (tok ~ /args/)               col="96"
+                    else                                 col="36"
+                    out = out "\033[" col "m" tok "\033[0m"
+                    $0 = substr($0, RSTART+RLENGTH)
+                }
+                print out $0
+            }')
+        fi
+        coloured="${coloured} ${a}"
+    fi
+    printf '  %s%*s%s\n' "$coloured" "$pad" "" "$desc"
+}
+
+usage() {
+    printf '%s\n\n' "${c_bold}gnrdev${c_off} — dockerized Genropy dev environment"
+
+    printf '%s\n' "${c_bold}${c_ylw}STACK${c_off}"
+    help_line new      "<project> [instance]" "create a project configuration"
+    help_line up       "<project>"            "start the stack"
+    help_line down     "<project>"            "stop the stack"
+    help_line restart  "<project>[.svc]"      "restart a service (default: app)"
+    help_line rm       "<project>"            "remove containers, volumes and config"
+    help_line ls       ""                     "list projects and their status"
+    help_line rebuild  "<project>"            "rebuild the image"
+    help_line network  "<create|rm|list>"     "manage shared networks"
+
+    printf '\n%s\n' "${c_bold}${c_ylw}DEVELOPMENT${c_off}"
+    help_line gnr       "<project> <args...>" "run the gnr CLI in the container"
+    help_line dbcheck   "<project>"           "show pending schema changes"
+    help_line dbmigrate "<project>"           "create/update the database schema"
+
+    printf '\n%s\n' "${c_bold}${c_ylw}DATABASE${c_off}"
+    help_line backup  "<project> [file]"  "dump every database to one .sql.gz"
+    help_line restore "<project> <file>"  "restore a dump into the project"
+    help_line backups ""                  "list the backups taken so far"
+    help_line psql    "<project>"         "psql client on the database"
+
+    printf '\n%s\n' "${c_bold}${c_ylw}DEBUGGING${c_off}"
+    help_line logs  "<project>[.svc] [-f]" "logs (all services, or just the one)"
+    help_line shell "<project>[.svc]"      "shell in the container (default: app)"
+    help_line debug "<project>"            "restart the server with debugpy"
+
+    printf '\n%s\n' "${c_bold}${c_ylw}OPTIONS${c_off}"
+    cat <<EOF
+  ${c_grn}new${c_off}       --network ${c_cyan}<name>${c_off}    attach to a shared network, creating it if needed
+  ${c_grn}up${c_off}        --framework-src     use the framework from the git checkout
+            --build             force an image rebuild
+            --no-dbmigrate      skip schema creation on first start
+            --network ${c_cyan}<name>${c_off}    force a network for this run (.env untouched)
+  ${c_grn}backup${c_off}    --offline           stop the other services while dumping
+  ${c_grn}restore${c_off}   --online            do not stop anything (default: quiesce first)
+            --yes, -y           do not ask for confirmation
+  ${c_grn}rm${c_off}        --keep-env          keep the project .env
+            --yes, -y           do not ask for confirmation
+EOF
+
+    printf '\n%s\n' "${c_cyan}<project>${c_off}${c_mag}[.svc]${c_off}${c_dim} targets one container: app, db (also init-perms,"
+    printf '%s\n' "framework-src). Example: ./gnrdev logs sandbox.app -f${c_off}"
+    printf '\n%s\n' "${c_dim}Ports: web from 9000, debug from 9100, same offset per project."
+    printf '%s\n' "Projects sharing a network reach each other on internal ports by name:"
+    printf '%s\n' "http://sandbox:9000${c_off}"
+}
+
+env_file_for() {
+    local p="$1"
+    local f="projects/${p}.env"
+    [ -f "$f" ] || err "project '${p}' is not configured (${f} missing). Run: ./gnrdev new ${p}"
+    echo "$f"
+}
+
+# Reads a variable from a project .env (empty when absent).
+env_get() {
+    grep "^${2}=" "$(env_file_for "$1")" 2>/dev/null | cut -d= -f2- | tail -1
+}
+
+# docker compose with the right files and variables
+# The network in effect: the one forced with `up --network` wins over the .env.
+net_for() {
+    if [ -n "${GNR_NETWORK_OVERRIDE:-}" ]; then
+        echo "$GNR_NETWORK_OVERRIDE"
+    else
+        env_get "$1" GNR_NETWORK
+    fi
+}
+
+dc() {
+    local p="$1"; shift
+    local files=(-f compose.project.yaml)
+    if [ "${USE_FRAMEWORK_SRC:-0}" = "1" ]; then
+        files+=(-f compose.framework.yaml)
+    fi
+    # The shared-network override only applies when a network is in effect.
+    local net; net=$(net_for "$p")
+    if [ -n "$net" ]; then
+        files+=(-f compose.network.yaml)
+        # Passed on the command line so it takes precedence over the .env value
+        # without rewriting the file.
+        GNR_NETWORK="$net" docker compose --env-file .env \
+            --env-file "$(env_file_for "$p")" "${files[@]}" "$@"
+        return $?
+    fi
+    docker compose --env-file .env --env-file "$(env_file_for "$p")" "${files[@]}" "$@"
+}
+
+# ---------------------------------------------------------------- port allocation
+# Two parallel ranges with a fixed offset: the last digits tie a project's web
+# port to its debug port.
+#
+#   web    9000, 9001, 9002, ...   (GNR_PORT_WEB_BASE)
+#   debug  9100, 9101, 9102, ...   (GNR_PORT_DEBUG_BASE)
+#
+# We look for a slot (the offset from the base) free in BOTH ranges, so the
+# pairing holds even when one of the two ports is taken.
+port_in_use() {
+    local port="$1"
+    grep -qsh "^GNR_PORT_\(WEB\|DEBUG\|DB\)=${port}$" projects/*.env 2>/dev/null && return 0
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# Prints "<web_port> <debug_port>" for the first slot free in both ranges.
+next_free_slot() {
+    local web_base="$1" debug_base="$2"
+    local slot=0
+    while [ "$slot" -lt 100 ]; do
+        local web=$((web_base + slot)) dbg=$((debug_base + slot))
+        if ! port_in_use "$web" && ! port_in_use "$dbg"; then
+            echo "$web $dbg"
+            return 0
+        fi
+        slot=$((slot + 1))
+    done
+    err "no free slot in ranges ${web_base}+ / ${debug_base}+"
+}
+
+# ---------------------------------------------------------------- commands
+cmd_new() {
+    local project="" instance="" network=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --network) [ -n "${2:-}" ] || err "--network needs a name"; network="$2"; shift 2 ;;
+            --network=*) network="${1#*=}"; shift ;;
+            -*) err "unknown option: $1" ;;
+            *)
+                if [ -z "$project" ]; then project="$1"
+                elif [ -z "$instance" ]; then instance="$1"
+                else err "too many arguments: $1"
+                fi; shift ;;
+        esac
+    done
+    [ -n "$project" ] || err "usage: ./gnrdev new <project> [instance] [--network <name>]"
+    local target="projects/${project}.env"
+    [ -f "$target" ] && err "${target} already exists"
+
+    # shellcheck disable=SC1091
+    source .env
+    local host_projects="${HOST_PROJECTS:?}"
+    local pdir="${host_projects}/${project}"
+    [ -d "$pdir" ] || warn "directory ${pdir} does not exist on the host"
+
+    # instance: when not given, derive it from the project
+    if [ -z "$instance" ]; then
+        if [ -d "${pdir}/instances" ]; then
+            local found
+            found=$(find "${pdir}/instances" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | sort)
+            local count
+            count=$(echo "$found" | grep -c . || true)
+            if [ "$count" = "1" ]; then
+                instance="$found"
+                info "instance detected: ${instance}"
+            elif [ "$count" -gt 1 ]; then
+                echo "Instances available in ${project}:"
+                echo "$found" | sed 's/^/  - /'
+                err "pick one: ./gnrdev new ${project} <instance>"
+            fi
+        fi
+        [ -n "$instance" ] || instance="$project"
+    fi
+
+    local web debug
+    read -r web debug <<< "$(next_free_slot "${GNR_PORT_WEB_BASE:-9000}" "${GNR_PORT_DEBUG_BASE:-9100}")"
+
+    sed -e "s/__PROJECT__/${project}/g" \
+        -e "s/__INSTANCE__/${instance}/g" \
+        -e "s/__PORT_WEB__/${web}/g" \
+        -e "s/__PORT_DEBUG__/${debug}/g" \
+        projects/_template.env > "$target"
+
+    if [ -n "$network" ]; then
+        sed -i '' "s/^GNR_NETWORK=.*/GNR_NETWORK=${network}/" "$target" 2>/dev/null \
+            || sed -i "s/^GNR_NETWORK=.*/GNR_NETWORK=${network}/" "$target"
+        if ! docker network inspect "$network" >/dev/null 2>&1; then
+            docker network create "$network" >/dev/null \
+                || err "could not create network '${network}'"
+            info "created network '${network}'"
+        fi
+    fi
+
+    info "created ${target}"
+    echo "    project  : ${project}"
+    echo "    instance : ${instance}"
+    echo "    web      : http://localhost:${web}"
+    echo "    debugpy  : ${debug}"
+    [ -n "$network" ] && echo "    network  : ${network}"
+    echo
+    echo "Review ${target} (GNR_MAINPACKAGE, GNR_DEP_PROJECTS), then: ./gnrdev up ${project}"
+}
+
+cmd_up() {
+    local project="${1:-}"; shift || true
+    [ -n "$project" ] || err "usage: ./gnrdev up <project> [--framework-src] [--build] [--no-dbmigrate] [--network <name>]"
+    local build_args=()
+    local do_dbmigrate=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --framework-src) export USE_FRAMEWORK_SRC=1; shift ;;
+            --build) build_args+=(--build); shift ;;
+            --no-dbmigrate) do_dbmigrate=0; shift ;;
+            # Forces the network for this run only: the .env is left untouched.
+            --network) [ -n "${2:-}" ] || err "--network needs a name"
+                       export GNR_NETWORK_OVERRIDE="$2"; shift 2 ;;
+            --network=*) export GNR_NETWORK_OVERRIDE="${1#*=}"; shift ;;
+            *) err "unknown option: $1" ;;
+        esac
+    done
+    if [ -n "${GNR_NETWORK_OVERRIDE:-}" ]; then
+        docker network inspect "$GNR_NETWORK_OVERRIDE" >/dev/null 2>&1 \
+            || err "network '${GNR_NETWORK_OVERRIDE}' does not exist: ./gnrdev network create ${GNR_NETWORK_OVERRIDE}"
+        info "forcing network '${GNR_NETWORK_OVERRIDE}' (${c_dim}.env unchanged${c_off})"
+    fi
+    info "starting ${project}"
+    dc "$project" up -d ${build_args[@]+"${build_args[@]}"}
+
+    local ef; ef=$(env_file_for "$project")
+    local web; web=$(grep '^GNR_PORT_WEB=' "$ef" | cut -d= -f2)
+    local inst; inst=$(grep '^GNR_INSTANCE=' "$ef" | cut -d= -f2)
+
+    # On an empty database the app cannot start: without a schema it fails with
+    # 'relation "adm.adm_preference" does not exist'. Create it on first start.
+    if [ "$do_dbmigrate" = "1" ] && ! db_is_ready "$project"; then
+        info "empty database: creating the schema (one-off, may take a minute)"
+        if db_cmd "$project" apply; then
+            dc "$project" restart app >/dev/null 2>&1
+        else
+            warn "schema creation failed: see ./gnrdev logs ${project}"
+        fi
+    fi
+
+    echo
+    info "ready: ${c_grn}http://localhost:${web}${c_off}"
+    echo "${c_dim}    logs:  ./gnrdev logs ${project} -f${c_off}"
+    echo "${c_dim}    shell: ./gnrdev shell ${project}${c_off}"
+}
+
+# Accepts both "project" and "project.service" (e.g. sandbox.db).
+# Sets the globals TARGET_PROJECT and TARGET_SERVICE; the latter stays empty
+# when no service was given.
+split_target() {
+    local spec="${1:-}"
+    TARGET_PROJECT="${spec%%.*}"
+    if [ "$spec" = "$TARGET_PROJECT" ]; then
+        TARGET_SERVICE=""
+    else
+        TARGET_SERVICE="${spec#*.}"
+        case "$TARGET_SERVICE" in
+            app|db|init-perms|framework-src) ;;
+            *) err "unknown service: '${TARGET_SERVICE}' (use app, db, init-perms or framework-src)" ;;
+        esac
+    fi
+}
+
+cmd_down()    { local p="${1:?usage: ./gnrdev down <project>}"; shift || true; dc "$p" down "$@"; }
+
+cmd_restart() {
+    split_target "${1:?usage: ./gnrdev restart <project>[.service]}"
+    dc "$TARGET_PROJECT" restart "${TARGET_SERVICE:-app}"
+}
+
+cmd_logs() {
+    split_target "${1:?usage: ./gnrdev logs <project>[.service] [-f]}"; shift || true
+    dc "$TARGET_PROJECT" logs ${TARGET_SERVICE:+"$TARGET_SERVICE"} "$@"
+}
+
+cmd_shell() {
+    split_target "${1:?usage: ./gnrdev shell <project>[.service]}"
+    if [ "${TARGET_SERVICE:-app}" = "db" ]; then
+        # the postgres image has no bash
+        dc "$TARGET_PROJECT" exec db sh
+    else
+        dc "$TARGET_PROJECT" exec "${TARGET_SERVICE:-app}" bash
+    fi
+}
+cmd_rebuild() { local p="${1:?usage: ./gnrdev rebuild <project>}"; dc "$p" build --no-cache; }
+
+cmd_gnr() {
+    local p="${1:?usage: ./gnrdev gnr <project> <args...>}"; shift
+    dc "$p" exec app gnr "$@"
+}
+
+cmd_psql() {
+    local p="${1:?usage: ./gnrdev psql <project>}"
+    local ef; ef=$(env_file_for "$p")
+    local db user
+    db=$(grep '^GNR_DB_NAME=' "$ef" | cut -d= -f2)
+    user=$(grep '^GNR_DB_USER=' "$ef" | cut -d= -f2 || echo genro)
+    dc "$p" exec db psql -U "${user:-genro}" -d "$db"
+}
+
+
+# ---------------------------------------------------------------- database
+# Does the schema already exist? Checks for adm.adm_preference, the table whose
+# absence makes the application fail at startup.
+db_is_ready() {
+    local p="$1"
+    local ef; ef=$(env_file_for "$p")
+    local db user
+    db=$(grep '^GNR_DB_NAME=' "$ef" | cut -d= -f2)
+    user=$(grep '^GNR_DB_USER=' "$ef" | cut -d= -f2)
+    dc "$p" exec -T db psql -U "${user:-genro}" -d "$db" -tAc \
+        "select to_regclass('adm.adm_preference') is not null" 2>/dev/null \
+        | tr -d '[:space:]' | grep -q '^t$'
+}
+
+# Single engine: `gnr db migrate` (NG, based on SqlMigrator).
+db_cmd() {
+    local p="$1"; local mode="$2"
+    local ef; ef=$(env_file_for "$p")
+    local inst; inst=$(grep '^GNR_INSTANCE=' "$ef" | cut -d= -f2)
+    if [ "$mode" = "check" ]; then
+        dc "$p" exec -T app gnr db migrate -c -v "$inst"
+    else
+        dc "$p" exec -T app gnr db migrate -u "$inst"
+    fi
+}
+
+cmd_dbmigrate() {
+    local p="${1:?usage: ./gnrdev dbmigrate <project>}"; shift
+    [ $# -eq 0 ] || err "dbmigrate takes no options (got: $*)"
+    info "updating the database schema of ${p}"
+    db_cmd "$p" apply
+}
+
+cmd_dbcheck() {
+    local p="${1:?usage: ./gnrdev dbcheck <project>}"; shift
+    [ $# -eq 0 ] || err "dbcheck takes no options (got: $*)"
+    info "pending schema changes for ${p} (nothing applied)"
+    db_cmd "$p" check
+}
+
+cmd_debug() {
+    local p="${1:?usage: ./gnrdev debug <project>}"
+    local ef; ef=$(env_file_for "$p")
+    local inst dbg
+    inst=$(grep '^GNR_INSTANCE=' "$ef" | cut -d= -f2)
+    dbg=$(grep '^GNR_PORT_DEBUG=' "$ef" | cut -d= -f2)
+    local web; web=$(grep '^GNR_PORT_WEB=' "$ef" | cut -d= -f2)
+    info "restarting ${inst} with debugpy"
+    dc "$p" exec -d app supervisorctl stop gnrserve
+    dc "$p" exec -d app supervisorctl start debugbridge
+    dc "$p" exec -d app gnr web serve "$inst" -p "$web" --debugpy
+    echo
+    echo "Attach from your IDE to ${c_grn}localhost:${dbg}${c_off}"
+    warn "autoreload is off under --debugpy: after editing run ./gnrdev restart ${p}"
+}
+
+
+# ---------------------------------------------------------------- removal
+# Removes containers, volumes and (optionally) the project configuration.
+# The database volume goes with it, so the schema and its data are lost:
+# always show what will disappear and ask, unless --yes was given.
+cmd_rm() {
+    local project="${1:-}"; shift || true
+    [ -n "$project" ] || err "usage: ./gnrdev rm <project> [--keep-env] [--yes]"
+    local ef; ef=$(env_file_for "$project")
+    local keep_env=0 assume_yes=0
+    for arg in "$@"; do
+        case "$arg" in
+            --keep-env) keep_env=1 ;;
+            --yes|-y)   assume_yes=1 ;;
+            *) err "unknown option: ${arg}" ;;
+        esac
+    done
+
+    echo "This will remove:"
+    local names; names=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep "^gnr-${project}-" || true)
+    if [ -n "$names" ]; then
+        echo "$names" | sed 's/^/  container  /'
+    else
+        echo "  (no container running or stopped)"
+    fi
+    local vols; vols=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep "^gnr-${project}_" || true)
+    if [ -n "$vols" ]; then
+        echo "$vols" | sed 's/^/  volume     /'
+        echo "  ${c_ylw}the database volume is included: schema and data will be lost${c_off}"
+    fi
+    [ "$keep_env" = "0" ] && echo "  config     ${ef}"
+    echo "  ${c_dim}sources on the host are never touched${c_off}"
+
+    if [ "$assume_yes" = "0" ]; then
+        printf "\nProceed? [y/N] "
+        local reply; read -r reply
+        case "$reply" in
+            y|Y|yes|YES) ;;
+            *) echo "aborted"; return 1 ;;
+        esac
+    fi
+
+    info "removing containers and volumes of ${project}"
+    dc "$project" down --volumes --remove-orphans 2>&1 | grep -vE "^$" || true
+    if [ "$keep_env" = "0" ]; then
+        rm -f "$ef"
+        info "removed ${ef}"
+    else
+        info "kept ${ef} (--keep-env): ./gnrdev up ${project} recreates the stack"
+    fi
+}
+
+# ---------------------------------------------------------------- shared network
+cmd_network() {
+    local action="${1:-list}"; shift || true
+    case "$action" in
+        create)
+            local name="${1:?usage: ./gnrdev network create <name>}"
+            if docker network inspect "$name" >/dev/null 2>&1; then
+                info "network '${name}' already exists"
+            else
+                docker network create "$name" >/dev/null
+                info "created network '${name}'"
+            fi
+            echo "Add to the .env of every project that should join it:"
+            echo "  ${c_dim}GNR_NETWORK=${name}${c_off}"
+            ;;
+        rm)
+            local name="${1:?usage: ./gnrdev network rm <name>}"
+            docker network rm "$name" >/dev/null && info "removed network '${name}'"
+            ;;
+        list|ls)
+            shopt -s nullglob
+            local nets="" isolated=""
+            for f in projects/*.env; do
+                [ "$(basename "$f")" = "_template.env" ] && continue
+                local pj nt
+                pj=$(basename "$f" .env)
+                nt=$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1)
+                if [ -z "$nt" ]; then
+                    isolated="${isolated} ${pj}"
+                else
+                    nets="${nets}${nt}\n"
+                fi
+            done
+            if [ -n "$nets" ]; then
+                printf "%-24s %-12s %s\n" NETWORK STATUS PROJECTS
+                local nt st members
+                while read -r nt; do
+                    [ -n "$nt" ] || continue
+                    if docker network inspect "$nt" >/dev/null 2>&1; then
+                        st="${c_grn}$(printf '%-12s' available)${c_off}"
+                    else
+                        st="${c_red}$(printf '%-12s' missing)${c_off}"
+                    fi
+                    members=""
+                    for f in projects/*.env; do
+                        [ "$(basename "$f")" = "_template.env" ] && continue
+                        if [ "$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1)" = "$nt" ]; then
+                            members="${members}$(basename "$f" .env), "
+                        fi
+                    done
+                    printf "%-24s %s %s\n" "$nt" "$st" "${members%, }"
+                done <<< "$(printf "$nets" | sort -u)"
+            else
+                echo "no project is attached to a shared network"
+            fi
+            if [ -n "$isolated" ]; then
+                echo "${c_dim}isolated:${isolated}${c_off}"
+            fi
+            ;;
+        *) err "unknown subcommand: ${action} (use create, rm or list)" ;;
+    esac
+}
+
+
+# ---------------------------------------------------------------- backup / restore
+# One gzipped file per backup, produced by pg_dumpall: it captures every
+# database of the project cluster (Genropy multidb instances keep one database
+# per store) plus roles, so a restore rebuilds the cluster as it was.
+BACKUP_DIR="backups"
+
+# Stops every service of the stack except the database, remembering which ones
+# were actually running. Sets STOPPED_SERVICES for restore_services().
+stop_services_but_db() {
+    local p="$1"
+    STOPPED_SERVICES=""
+    local running
+    running=$(dc "$p" ps --services --filter status=running 2>/dev/null | grep -v '^db$' || true)
+    [ -n "$running" ] || return 0
+    STOPPED_SERVICES=$(echo "$running" | tr '\n' ' ')
+    info "stopping:${STOPPED_SERVICES%% }"
+    # shellcheck disable=SC2086
+    dc "$p" stop $STOPPED_SERVICES >/dev/null 2>&1 || true
+}
+
+# Restarts what stop_services_but_db() stopped. Invoked from a trap, so it runs
+# even when the command fails or is interrupted.
+restore_services() {
+    local p="$1"
+    [ -n "${STOPPED_SERVICES:-}" ] || return 0
+    info "restarting:${STOPPED_SERVICES%% }"
+    # shellcheck disable=SC2086
+    dc "$p" start $STOPPED_SERVICES >/dev/null 2>&1 || true
+    STOPPED_SERVICES=""
+}
+
+
+backup_default_name() {
+    echo "${BACKUP_DIR}/${1}_$(date +%Y-%m-%d__%H-%M-%S).sql.gz"
+}
+
+cmd_backup() {
+    local project="${1:-}"; shift || true
+    [ -n "$project" ] || err "usage: ./gnrdev backup <project> [file]"
+    local target="" offline=0
+    for arg in "$@"; do
+        case "$arg" in
+            --offline) offline=1 ;;
+            -*) err "unknown option: ${arg}" ;;
+            *) [ -z "$target" ] && target="$arg" || err "too many arguments: ${arg}" ;;
+        esac
+    done
+    env_file_for "$project" >/dev/null
+
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^gnr-${project}-db$" \
+        || err "the database of '${project}' is not running: ./gnrdev up ${project}"
+
+    [ -n "$target" ] || target="$(backup_default_name "$project")"
+    case "$target" in
+        *.gz) ;;
+        *) target="${target}.gz" ;;
+    esac
+    mkdir -p "$(dirname "$target")"
+
+    local user; user=$(env_get "$project" GNR_DB_USER); user="${user:-genro}"
+
+    # --offline: quiesce the stack so nothing writes while the dump runs.
+    # The trap guarantees the containers come back even on failure or Ctrl-C.
+    if [ "$offline" = "1" ]; then
+        trap 'restore_services "$project"' EXIT INT TERM
+        stop_services_but_db "$project"
+    fi
+
+    info "dumping the ${project} cluster"
+    # Roles are filtered out (the cluster is dedicated to the project and its
+    # role already exists) and so are template1/postgres: they are service
+    # databases, and psql connects to postgres during the restore, so replaying
+    # them would only produce "cannot drop the currently open database".
+    if ! dc "$project" exec -T db pg_dumpall -U "$user" --clean --if-exists \
+         --no-role-passwords --exclude-database=template1 --exclude-database=postgres \
+         | grep -vE "^(CREATE|ALTER|DROP) ROLE |^GRANT .* TO |^REVOKE .* FROM " \
+         | gzip > "$target"; then
+        rm -f "$target"
+        err "backup failed"
+    fi
+    # pg_dumpall reports errors on stderr but still exits 0 in some cases:
+    # an almost-empty file means something went wrong.
+    local size; size=$(wc -c < "$target" | tr -d ' ')
+    [ "$size" -gt 1000 ] || { rm -f "$target"; err "backup produced an empty file"; }
+
+    if [ "$offline" = "1" ]; then
+        restore_services "$project"
+        trap - EXIT INT TERM
+    fi
+
+    info "written ${c_grn}${target}${c_off} ($(du -h "$target" | cut -f1 | tr -d ' '))"
+}
+
+cmd_restore() {
+    local project="${1:-}"; shift || true
+    [ -n "$project" ] || err "usage: ./gnrdev restore <project> <file> [--yes]"
+    local src="" assume_yes=0 online=0
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y) assume_yes=1 ;;
+            --online) online=1 ;;
+            -*) err "unknown option: ${arg}" ;;
+            *) [ -z "$src" ] && src="$arg" || err "too many arguments: ${arg}" ;;
+        esac
+    done
+    [ -n "$src" ] || err "usage: ./gnrdev restore <project> <file> [--yes]"
+    [ -f "$src" ] || err "file not found: ${src}"
+    env_file_for "$project" >/dev/null
+
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^gnr-${project}-db$" \
+        || err "the database of '${project}' is not running: ./gnrdev up ${project}"
+
+    if [ "$assume_yes" = "0" ]; then
+        echo "Restoring ${c_grn}${src}${c_off} into ${project}."
+        echo "${c_ylw}The current content of the cluster will be replaced.${c_off}"
+        printf "Proceed? [y/N] "
+        local reply; read -r reply
+        case "$reply" in y|Y|yes|YES) ;; *) echo "aborted"; return 1 ;; esac
+    fi
+
+    local user; user=$(env_get "$project" GNR_DB_USER); user="${user:-genro}"
+
+    # By default the stack is quiesced: open connections would prevent the dump
+    # from dropping and recreating the databases. --online skips that, which
+    # only makes sense when nothing is holding connections.
+    if [ "$online" = "0" ]; then
+        trap 'restore_services "$project"' EXIT INT TERM
+        stop_services_but_db "$project"
+    else
+        warn "--online: the stack keeps running, the restore may fail on open connections"
+    fi
+
+    info "restoring into ${project}"
+    local rc=0
+    case "$src" in
+        *.gz) gzip -dc "$src" | dc "$project" exec -T db psql -U "$user" -d postgres -q >/dev/null || rc=$? ;;
+        *)    dc "$project" exec -T db psql -U "$user" -d postgres -q < "$src" >/dev/null || rc=$? ;;
+    esac
+
+    if [ "$online" = "0" ]; then
+        restore_services "$project"
+        trap - EXIT INT TERM
+    fi
+    [ "$rc" -eq 0 ] || err "restore finished with errors (exit ${rc})"
+    info "restore complete"
+}
+
+cmd_backups() {
+    mkdir -p "$BACKUP_DIR"
+    local rows; rows=$(ls -1t "${BACKUP_DIR}"/*.sql.gz 2>/dev/null || true)
+    if [ -z "$rows" ]; then
+        echo "no backup in ${BACKUP_DIR}/"
+        return 0
+    fi
+    printf "%-46s %-8s %s\n" FILE SIZE DATE
+    while read -r f; do
+        [ -n "$f" ] || continue
+        printf "%-46s %-8s %s\n" "$(basename "$f")" \
+            "$(du -h "$f" | cut -f1 | tr -d ' ')" \
+            "$(date -r "$f" '+%Y-%m-%d %H:%M')"
+    done <<< "$rows"
+}
+
+cmd_ls() {
+    shopt -s nullglob
+    local files=(projects/*.env)
+    [ ${#files[@]} -eq 0 ] && { echo "no project configured — run ./gnrdev new <project>"; return; }
+    printf "%-18s %-16s %-6s %-14s %-9s %-6s %s\n" \
+        PROJECT INSTANCE PORT NETWORK STATUS DEBUG URL
+    for f in "${files[@]}"; do
+        [ "$(basename "$f")" = "_template.env" ] && continue
+        local p i w nt st dbg
+        p=$(grep '^GNR_PROJECT=' "$f" | cut -d= -f2)
+        i=$(grep '^GNR_INSTANCE=' "$f" | cut -d= -f2)
+        w=$(grep '^GNR_PORT_WEB=' "$f" | cut -d= -f2)
+        nt=$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1)
+        [ -n "$nt" ] || nt="-"
+        # Pad the plain word first, then colour it: escape sequences have no
+        # width, so padding a coloured string would misalign the columns.
+        dbg="$(printf '%-6s' '-')"
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^gnr-${p}-app$"; then
+            st="${c_grn}$(printf '%-9s' running)${c_off}"
+            # Debug mode leaves a `gnr web serve ... --debugpy` running outside
+            # supervisor. The probing shell is skipped by PID: its own command
+            # line contains the pattern and would always match.
+            if docker exec "gnr-${p}-app" sh -c \
+                 'self=$$; for x in /proc/[0-9]*; do
+                    [ "${x#/proc/}" = "$self" ] && continue
+                    case "$(tr "\0" " " < $x/cmdline 2>/dev/null)" in
+                      *"web serve"*--debugpy*) exit 0;;
+                    esac
+                  done; exit 1' 2>/dev/null; then
+                local dport; dport=$(grep '^GNR_PORT_DEBUG=' "$f" 2>/dev/null | cut -d= -f2)
+                dbg="${c_mag}$(printf '%-6s' "${dport:-on}")${c_off}"
+            fi
+        else
+            st="${c_dim}$(printf '%-9s' stopped)${c_off}"
+        fi
+        printf "%-18s %-16s %-6s %-14s %s %s %s\n" "$p" "$i" "$w" "$nt" "$st" "$dbg" "http://localhost:${w}"
+    done
+}
+
+case "${1:-}" in
+    new)     shift; cmd_new "$@" ;;
+    up)      shift; cmd_up "$@" ;;
+    down)    shift; cmd_down "$@" ;;
+    restart) shift; cmd_restart "$@" ;;
+    logs)    shift; cmd_logs "$@" ;;
+    shell)   shift; cmd_shell "$@" ;;
+    gnr)     shift; cmd_gnr "$@" ;;
+    psql)    shift; cmd_psql "$@" ;;
+    dbmigrate) shift; cmd_dbmigrate "$@" ;;
+    dbcheck) shift; cmd_dbcheck "$@" ;;
+    debug)   shift; cmd_debug "$@" ;;
+    rebuild) shift; cmd_rebuild "$@" ;;
+    ls)      shift; cmd_ls "$@" ;;
+    rm)      shift; cmd_rm "$@" ;;
+    backup)  shift; cmd_backup "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
+    backups) shift; cmd_backups "$@" ;;
+    network) shift; cmd_network "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) err "unknown command: $1 (run ./gnrdev help)" ;;
+esac

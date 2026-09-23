@@ -1,0 +1,29 @@
+# Applied when the project declares GNR_NETWORK.
+#
+# Puts app and db on a Docker network shared across stacks, so projects reach
+# each other on INTERNAL ports without publishing them. Two stable aliases:
+#   <project>      -> the app container, on GNR_PORT_WEB
+#   <project>-db   -> its database, on 5432
+#
+# e.g. from edodevel, sandbox's API is http://sandbox:9000
+
+services:
+  db:
+    networks:
+      default: {}
+      shared:
+        aliases:
+          - "${GNR_PROJECT}-db"
+
+  app:
+    networks:
+      default: {}
+      shared:
+        aliases:
+          - "${GNR_PROJECT}"
+
+networks:
+  default: {}
+  shared:
+    external: true
+    name: "${GNR_NETWORK}"

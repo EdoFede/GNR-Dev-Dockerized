@@ -1,0 +1,48 @@
+<?xml version="1.0" ?>
+<!--
+  Genropy config for the dockerized dev environment, mounted read-only on
+  /home/genro/.gnr (replacing the one from the official image).
+
+  <gnrdaemon> holds literal values, not {GNR_*} placeholders: getFullOptions()
+  in gnr/web/daemon/handler.py re-reads this file WITHOUT env interpolation.
+-->
+<GenRoBag>
+	<!--
+	  ORDER MATTERS: project_path() returns the FIRST directory containing the
+	  project. 'gnrextra' exists both in genropy_projects (partial) and in
+	  gnrextra_projects (complete), hence this order.
+	  GNR_LOCAL_PROJECTS, set by compose, still wins over all of these.
+	-->
+	<projects>
+		<genropy path="/home/genro/genropy/projects"/>
+		<gnrextra path="/home/genro/gnrextra_projects"/>
+		<custom path="/home/genro/genropy_projects"/>
+		<external path="/home/genro/external_projects"/>
+	</projects>
+
+	<static>
+		<js>
+			<dojo_11 cdn="" path="/home/genro/genropy/dojo_libs/dojo_11"/>
+			<dojo_20 cdn="" path="/home/genro/genropy/dojo_libs/dojo_20"/>
+			<gnr_11 path="/home/genro/genropy/gnrjs/gnr_d11"/>
+			<gnr_20 path="/home/genro/genropy/gnrjs/gnr_d20"/>
+		</js>
+	</static>
+
+	<resources>
+		<genropy path="/home/genro/genropy/resources"/>
+	</resources>
+
+	<webtools>
+		<genropy path="/home/genro/genropy/webtools"/>
+	</webtools>
+
+	<gnrdaemon host="localhost" port="40404" hmac_key="gnrdev"/>
+
+	<!--
+	  Must be set: otherwise the framework generates one and tries to REWRITE
+	  this file (gnrconfig.py:219-229), which fails on a read-only mount.
+	  Local development value only.
+	-->
+	<external_secret>gnrdev-local-development-secret</external_secret>
+</GenRoBag>

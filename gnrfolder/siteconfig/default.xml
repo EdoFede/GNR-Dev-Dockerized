@@ -1,0 +1,20 @@
+<?xml version="1.0" ?>
+<!--
+  This file does NOT exist in the official image; without it there is no
+  reload/debug and no control over the wsgi port.
+
+  The port here is only a default: supervisor starts the server with
+  `-p ${GNR_PORT_WEB}`, the same port published on the host.
+-->
+<GenRoBag>
+	<wsgi port="8080" host="0.0.0.0" reload="true" debug="true"/>
+
+	<gui css_theme="mimi"/>
+
+	<jslib dojo_version="11" gnr_version="11"/>
+
+	<resources>
+		<common/>
+		<js_libs/>
+	</resources>
+</GenRoBag>

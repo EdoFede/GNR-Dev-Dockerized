@@ -1,0 +1,66 @@
+# Genropy dev image.
+#
+# Derives from the official multi-arch image (no rebuilding of lxml, weasyprint,
+# pymupdf, psycopg2) and adds only what development needs.
+# GENROPY_TAG pins the framework version (latest, develop, 26.05.05, ...).
+
+ARG GENROPY_TAG=latest
+FROM ghcr.io/genropy/genropy:${GENROPY_TAG}
+
+USER root
+
+# --- align uid/gid with the host ------------------------------------------------
+# The daemon writes into the bind-mounted sitepath (siteregister_data.pik,
+# sitedaemon.xml); misaligned ownership makes those files awkward on the host.
+ARG HOST_UID=501
+ARG HOST_GID=20
+RUN set -eux; \
+    if [ "$(id -u genro)" != "${HOST_UID}" ]; then \
+        usermod -u "${HOST_UID}" genro || true; \
+    fi; \
+    if [ "$(id -g genro)" != "${HOST_GID}" ]; then \
+        groupmod -g "${HOST_GID}" genro 2>/dev/null \
+            || usermod -g "${HOST_GID}" genro || true; \
+    fi; \
+    chown -R "${HOST_UID}:${HOST_GID}" /home/genro /var/log/supervisor || true
+
+# --- development tools ----------------------------------------------------------
+# socat bridges debugpy, which binds to the container's loopback
+# (serverwsgi.py:320) and would otherwise be unreachable from the host.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        postgresql-client \
+        socat \
+        netcat-openbsd \
+        less \
+        procps \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# watchdog is missing from the official image (only watchgod is there);
+# uv installs package requirements much faster than pip.
+RUN pip install --no-cache-dir watchdog uv
+
+# Force watchdog's PollingObserver: inotify events do not cross the bind mount
+# on macOS. A .pth runs on every interpreter start, so it also covers the
+# children the reloader spawns.
+COPY docker/polling_observer.py /usr/local/lib/python3.11/site-packages/zz_gnrdev_polling.py
+RUN echo "import zz_gnrdev_polling" > /usr/local/lib/python3.11/site-packages/zz_gnrdev_polling.pth
+
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/supervisor/app.conf /etc/supervisor/conf.d/app.conf
+COPY docker/supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+    && rm -f /etc/supervisor/conf.d/genropy.conf
+
+USER genro
+WORKDIR /home/genro
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONUSERBASE=/home/genro/.local \
+    PATH=/home/genro/.local/bin:$PATH \
+    GENRO_GNRFOLDER=/home/genro/.gnr
+
+# The web port is decided at runtime (GNR_PORT_WEB); 5679 is the debugpy bridge.
+EXPOSE 5679
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]

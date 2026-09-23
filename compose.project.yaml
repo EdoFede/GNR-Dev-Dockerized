@@ -1,0 +1,117 @@
+# Dev stack for ONE Genropy project.
+#
+# The same file serves every project: only the --env-file changes. `name`
+# namespaces containers, network and volumes per project.
+#
+# Normally driven by ./gnrdev:
+#   docker compose --env-file projects/<project>.env -f compose.project.yaml up -d
+
+name: gnr-${GNR_PROJECT}
+
+services:
+  db:
+    image: postgres:${POSTGRES_TAG:-16}
+    container_name: gnr-${GNR_PROJECT}-db
+    hostname: gnr-${GNR_PROJECT}-db
+    environment:
+      POSTGRES_USER: ${GNR_DB_USER:-genro}
+      POSTGRES_PASSWORD: ${GNR_DB_PASSWORD:-genro}
+      POSTGRES_DB: ${GNR_DB_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Optional: only needed to connect with an external client.
+    ports:
+      - "${GNR_PORT_DB:-0}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${GNR_DB_USER:-genro} -d ${GNR_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # Named volumes are created root-owned; without this the genro user cannot
+  # install Python packages into them. Runs as root, fixes, exits.
+  init-perms:
+    image: busybox:latest
+    container_name: gnr-${GNR_PROJECT}-init
+    user: "0:0"
+    command: >
+      sh -c "mkdir -p /pylibs/lib /pylibs/bin &&
+             chown -R ${HOST_UID:-501}:${HOST_GID:-20} /pylibs &&
+             echo 'permessi del volume pylibs sistemati'"
+    volumes:
+      - pylibs:/pylibs
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+      args:
+        GENROPY_TAG: ${GENROPY_TAG:-latest}
+        HOST_UID: ${HOST_UID:-501}
+        HOST_GID: ${HOST_GID:-20}
+    image: gnrdev/${GNR_PROJECT}:${GENROPY_TAG:-latest}
+    container_name: gnr-${GNR_PROJECT}-app
+    hostname: gnr-${GNR_PROJECT}-app
+    depends_on:
+      db:
+        condition: service_healthy
+      init-perms:
+        condition: service_completed_successfully
+    environment:
+      # --- project identity ---
+      GNR_PROJECT: ${GNR_PROJECT}
+      GNR_INSTANCE: ${GNR_INSTANCE}
+      GNR_DEP_PROJECTS: ${GNR_DEP_PROJECTS:-}
+      # Used by supervisor for `gnr web serve -p`
+      GNR_PORT_WEB: ${GNR_PORT_WEB}
+
+      # --- Genropy config ---
+      GENRO_GNRFOLDER: /home/genro/.gnr
+      # Prepended to the project paths (pathresolver.py:61), so the current
+      # project wins. Note: the official image sets GNRLOCAL_PROJECTS (no
+      # underscore), which nothing reads — this is the name the code uses.
+      GNR_LOCAL_PROJECTS: /home/genro/genropy_projects/${GNR_PROJECT}
+      GNR_LOGLEVEL: ${GNR_LOGLEVEL:-info}
+
+      # --- database ---
+      GNR_DB_IMPLEMENTATION: ${GNR_DB_IMPLEMENTATION:-postgres}
+      GNR_DB_HOST: db
+      GNR_DB_PORT: "5432"
+      GNR_DB_NAME: ${GNR_DB_NAME}
+      GNR_DB_USER: ${GNR_DB_USER:-genro}
+      GNR_DB_PASSWORD: ${GNR_DB_PASSWORD:-genro}
+
+      # --- application ---
+      # All defaulted inline: an undefined {GNR_*} placeholder would silently
+      # break config interpolation.
+      GNR_ROOTPWD: ${GNR_ROOTPWD:-admin}
+      GNR_MAINPACKAGE: ${GNR_MAINPACKAGE:-}
+      GNR_EXTERNALHOST: ${GNR_EXTERNALHOST:-http://localhost:${GNR_PORT_WEB}}
+      GNR_LOCALE: ${GNR_LOCALE:-it_IT}
+
+      # --- development ---
+      # inotify events do not cross the bind mount on macOS; without forced
+      # polling Werkzeug's reloader never fires. See docker/polling_observer.py.
+      GNR_FORCE_POLLING: "1"
+      GNR_POLLING_INTERVAL: "${GNR_POLLING_INTERVAL:-1.0}"
+      PYTHONUNBUFFERED: "1"
+      # checkdep runs `pip install` without --user (gnrapp.py:1093); PIP_USER
+      # redirects it to PYTHONUSERBASE, i.e. the per-project `pylibs` volume.
+      PIP_USER: "1"
+    volumes:
+      - ./gnrfolder:/home/genro/.gnr:ro
+      - ${HOST_PROJECTS}:/home/genro/genropy_projects
+      - ${HOST_GNREXTRA}:/home/genro/gnrextra_projects
+      - pylibs:/home/genro/.local
+    # Same port inside and out, so the URL the framework logs is the real one.
+    ports:
+      - "${GNR_PORT_WEB}:${GNR_PORT_WEB}"
+      - "${GNR_PORT_DEBUG}:5679"
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+volumes:
+  pgdata:
+  pylibs:

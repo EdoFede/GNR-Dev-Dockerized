@@ -1,0 +1,33 @@
+<?xml version="1.0" ?>
+<!--
+  Global default for ALL instances; the project's own instanceconfig.xml wins
+  over it (get_instanceconfig does update(base_instance_config)).
+
+  <db> is needed because real projects only declare the dbname: host, user,
+  password and port come from here. envtemplate="t" enables $GNR_* expansion.
+
+  <sitedaemon/> is the key line: it enables the per-instance daemon, which makes
+  each project self-contained and removes the need for a shared central
+  GnrDaemon (see siteregister_client.py:136-148).
+-->
+<GenRoBag envtemplate="t">
+	<db implementation="$GNR_DB_IMPLEMENTATION"
+	    dbname="$GNR_DB_NAME"
+	    host="$GNR_DB_HOST"
+	    user="$GNR_DB_USER"
+	    port="$GNR_DB_PORT"
+	    password="$GNR_DB_PASSWORD"/>
+
+	<authentication>
+		<xml_auth defaultTags="user,xml">
+			<admin pwd="{GNR_ROOTPWD}" tags="superadmin,_DEV_,admin,user"/>
+			<root pwd="{GNR_ROOTPWD}" tags="_DEV_,admin"/>
+		</xml_auth>
+	</authentication>
+
+	<site>
+		<sitedaemon/>
+		<gnrdaemon host="localhost" port="40404" hmac_key="gnrdev"/>
+		<options liveUpdate="*"/>
+	</site>
+</GenRoBag>
