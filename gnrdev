@@ -455,7 +455,9 @@ cmd_up() {
         # shellcheck disable=SC2086
         docker rm -f $stale >/dev/null 2>&1 || true
     fi
-    dc "$project" up -d
+    # --remove-orphans: a service dropped from the compose files would otherwise
+    # keep running and hold on to the project's volumes.
+    dc "$project" up -d --remove-orphans
 
     local web; web=$(env_get "$project" GNR_PORT_WEB)
     local inst; inst=$(env_get "$project" GNR_INSTANCE)

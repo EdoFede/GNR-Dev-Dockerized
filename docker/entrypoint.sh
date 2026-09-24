@@ -31,6 +31,14 @@ if [ "$(id -u)" = "0" ]; then
         getent passwd "$uid" >/dev/null \
             || useradd -M -o -u "$uid" -g "$gid" -d /home/genro -s /bin/bash gnrdev
         chown "$uid:$gid" /home/genro /home/genro/.local
+        # Loading a package's startup data unpacks startup_data.gz into a .pik
+        # next to it, i.e. inside the framework tree. Only those directories
+        # are handed over; ones already owned (a mounted checkout) are skipped.
+        find /home/genro/genropy/projects -name startup_data.gz 2>/dev/null \
+            | while read -r f; do
+                d="$(dirname "$f")"
+                [ "$(stat -c %u "$d")" = "$uid" ] || chown "$uid:$gid" "$d"
+            done
         # stdout/stderr are root-owned 0600 pipes: supervisord reopens them by
         # path (/dev/stdout) and would get EACCES once root is dropped.
         chown "$uid" "/proc/$$/fd/1" "/proc/$$/fd/2" 2>/dev/null || true
@@ -63,10 +71,13 @@ done
 # in the instance (gnrapp.py:1037), wherever they live — including packages
 # inside the image (gnrcore:email -> mail-parser), which scanning the mounted
 # projects alone would miss. The hash stamp skips the work when nothing changed.
+# The packages the image ships are part of it: a different image (after a pull,
+# or a GENROPY_TAG change) can drop or add one, so it must re-check.
 if [ "${GNR_SKIP_CHECKDEP:-0}" != "1" ]; then
     STAMP="/home/genro/.local/.req-stamp"
     HASH="$( { find /home/genro/genropy_projects /home/genro/gnrextra_projects \
                     -maxdepth 4 -name requirements.txt -exec cat {} + 2>/dev/null || true; \
+               ls /usr/local/lib/python3.11/site-packages; \
                echo "${GNR_INSTANCE}"; } | sha256sum | cut -d' ' -f1)"
     if [ "${HASH}" != "$(cat "${STAMP}" 2>/dev/null || true)" ]; then
         log "checking the Python dependencies of the instance"
