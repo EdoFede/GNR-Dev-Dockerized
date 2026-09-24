@@ -1,0 +1,13 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<GenRoBag>
+	<db dbname="helloworld"></db>
+	<packages>
+		<helloworld pkgcode="helloworld"></helloworld>
+	</packages>
+	<authentication pkg="helloworld">
+		<py_auth defaultTags="user" pkg="adm" method="authenticate"></py_auth>
+	</authentication>
+	<site>
+		<wsgi mainpackage="helloworld"></wsgi>
+	</site>
+</GenRoBag>
