@@ -68,9 +68,9 @@ $ ./gnrdev up sandbox
 $ ./gnrdev new edodevel && ./gnrdev up edodevel
 
 $ ./gnrdev ls
-PROJECT            INSTANCE         STATUS    WEB PORT   DEBUG PORT  DB PORT  NETWORK        URL
-edodevel           edodevel         running   9001       -           9201     -              http://localhost:9001
-sandbox            sandboxpg        running   9000       -           9200     -              http://localhost:9000
+PROJECT          INSTANCE        STATUS    WEB PORT  DEBUG PORT DB PORT  NETWORK      FRAMEWORK              URL
+edodevel         edodevel        running   9001      -          9201     -            image (latest)         http://localhost:9001
+sandbox          sandboxpg       running   9000      -          9200     -            local (master)         http://localhost:9000
 ```
 
 Stacks are fully independent: stopping or breaking one leaves the others
@@ -108,7 +108,7 @@ container:
 ./gnrdev restart sandbox.db           # restart just the database
 ```
 
-Services: `app`, `db` (plus `init-perms`, `framework-src`).
+Services: `app`, `db` (plus `init-perms`, `init-fwgit`, `fwgit`).
 
 Containers get a hostname matching their name, so the shell prompt tells you
 where you are: `genro@gnr-sandbox-app`.
@@ -244,9 +244,9 @@ $ ./gnrdev network rm gnrdev          # detach projects first
 `gnrdev ls` also shows each project's network:
 
 ```
-PROJECT            INSTANCE         STATUS    WEB PORT   DEBUG PORT  DB PORT  NETWORK        URL
-edodevel           edodevel         running   9001       -           9201     gnrdev         http://localhost:9001
-sandbox            sandboxpg        running   9000       -           9200     gnrdev         http://localhost:9000
+PROJECT          INSTANCE        STATUS    WEB PORT  DEBUG PORT DB PORT  NETWORK      FRAMEWORK              URL
+edodevel         edodevel        running   9001      -          9201     gnrdev       image (latest)         http://localhost:9001
+sandbox          sandboxpg       running   9000      -          9200     gnrdev       git develop            http://localhost:9000
 ```
 
 Leaving `GNR_NETWORK` empty keeps a project isolated.
@@ -311,24 +311,50 @@ Two things to know:
 
 ## Framework version
 
-`GENROPY_TAG` in `.env` pins the official image tag (`latest`, `develop`, or a
-version like `26.05.05`). After changing it: `./gnrdev rebuild <project>`.
+By default the framework comes from the official image, at the tag set by
+`GENROPY_TAG` in `.env` (`latest`, `develop`, or a version such as `26.05.05`).
+After changing it: `./gnrdev rebuild <project>`.
 
-To work on the framework itself, or to use a specific branch/commit:
+Two other modes are available, and a project can be pinned to one at creation:
 
 ```bash
-./gnrdev up <project> --framework-src
+./gnrdev new <project> --framework-local        # the checkout on this host
+./gnrdev new <project> --framework-git develop  # a clone of that branch/commit
 ```
 
-This mounts the checkout at `HOST_GENROPY`, optionally moved to
-`GNR_FRAMEWORK_REF`, and installs it editable with the `[developer,pgsql]`
-profiles from the installation guide — framework edits take effect immediately.
-It also gives you the dojo versions missing from the official image.
+**`--framework-local`** bind-mounts `HOST_GENROPY` and installs it editable, so
+framework edits take effect immediately. The host checkout is used as it is: no
+git command touches it. It also gives you the dojo versions missing from the
+official image.
 
-It builds a separate image (tagged `:fwsrc`) with the framework removed from
-`site-packages`, which would otherwise shadow the mounted checkout. The
-entrypoint verifies the checkout is really in use and fails if it is not.
+**`--framework-git <ref>`** keeps a clone of the official repository in a
+per-project volume, isolated from the host. The ref is fetched and checked out
+**on every start**, so the container always matches what the repository
+publishes — and two projects can sit on different refs without conflict.
+`GNR_FRAMEWORK_REPO` in the project `.env` points it elsewhere if needed.
 
+Both modes build a separate image (`:fwsrc`) with the framework removed from
+`site-packages`, which would otherwise shadow the mounted one, and the
+entrypoint fails loudly if the checkout is not the one actually imported.
+
+`up` overrides the mode for a single run, leaving the `.env` untouched:
+
+```bash
+./gnrdev up <project> --framework-local
+./gnrdev up <project> --framework-git 26.05.05
+./gnrdev up <project> --framework-image     # back to the official image
+```
+
+The next start without a flag returns to whatever the `.env` says.
+
+`gnrdev ls` reports what each project is **actually running** in its FRAMEWORK
+column — `image (<tag>)`, `local (<branch>)` or `git <ref>` — read from the
+container. A `[OVR]` marker means the running container does not match the
+project `.env`, i.e. it was started with one of the flags above:
+
+```
+sandbox          ...   git master [OVR]       http://localhost:9000
+```
 ## Cross-project dependencies
 
 Declare them as usual in the instance config with

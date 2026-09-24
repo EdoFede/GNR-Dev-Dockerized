@@ -9,8 +9,7 @@
 <GenRoBag>
 	<!--
 	  ORDER MATTERS: project_path() returns the FIRST directory containing the
-	  project. 'gnrextra' exists both in genropy_projects (partial) and in
-	  gnrextra_projects (complete), hence this order.
+	  project.
 	  GNR_LOCAL_PROJECTS, set by compose, still wins over all of these.
 	-->
 	<projects>

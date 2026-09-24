@@ -98,10 +98,14 @@ usage() {
     printf '\n%s\n' "${c_bold}${c_ylw}OPTIONS${c_off}"
     cat <<EOF
   ${c_grn}new${c_off}       --network ${c_cyan}<name>${c_off}    attach to a shared network, creating it if needed
-  ${c_grn}up${c_off}        --framework-src     use the framework from the git checkout
-            --build             force an image rebuild
+            --framework-local   framework from the host checkout
+            --framework-git ${c_cyan}<ref>${c_off}  framework cloned at that branch/commit
+  ${c_grn}up${c_off}        --build             force an image rebuild
             --no-dbmigrate      skip schema creation on first start
             --network ${c_cyan}<name>${c_off}    force a network for this run (.env untouched)
+            --framework-local   ${c_dim}|${c_off} these override the .env for this
+            --framework-git ${c_cyan}<ref>${c_off}  ${c_dim}|${c_off} run only, without changing it
+            --framework-image   ${c_dim}|${c_off} (back to the official image)
   ${c_grn}backup${c_off}    --offline           stop the other services while dumping
   ${c_grn}restore${c_off}   --online            do not stop anything (default: quiesce first)
             --yes, -y           do not ask for confirmation
@@ -110,7 +114,7 @@ usage() {
 EOF
 
     printf '\n%s\n' "${c_cyan}<project>${c_off}${c_mag}[.svc]${c_off}${c_dim} targets one container: app, db (also init-perms,"
-    printf '%s\n' "framework-src). Example: ./gnrdev logs sandbox.app -f${c_off}"
+    printf '%s\n' "fwgit). Example: ./gnrdev logs sandbox.app -f${c_off}"
     printf '\n%s\n' "${c_dim}Ports: web from 9000, debug from 9100, same offset per project."
     printf '%s\n' "Projects sharing a network reach each other on internal ports by name:"
     printf '%s\n' "http://sandbox:9000${c_off}"
@@ -124,8 +128,11 @@ env_file_for() {
 }
 
 # Reads a variable from a project .env (empty when absent).
+# The trailing `|| true` matters: grep exits 1 when the key is missing, and
+# under `set -e` that would abort the caller — which is what happens with .env
+# files written before a variable was introduced.
 env_get() {
-    grep "^${2}=" "$(env_file_for "$1")" 2>/dev/null | cut -d= -f2- | tail -1
+    grep "^${2}=" "$(env_file_for "$1")" 2>/dev/null | cut -d= -f2- | tail -1 || true
 }
 
 # `docker compose exec` allocates a TTY unless -T is given, and without one the
@@ -133,6 +140,24 @@ env_get() {
 # is not a terminal, where a TTY would add stray \r and fail outright.
 exec_tty_flag() {
     [ -t 1 ] || printf -- '-T'
+}
+
+# Framework mode in effect: an override from `up` wins over the project .env.
+# Values: "" (official image), "local" (host checkout), "git" (cloned ref).
+fw_mode_for() {
+    if [ -n "${GNR_FW_MODE_OVERRIDE:-}" ]; then
+        if [ "$GNR_FW_MODE_OVERRIDE" = "image" ]; then echo ""; else echo "$GNR_FW_MODE_OVERRIDE"; fi
+    else
+        env_get "$1" GNR_FRAMEWORK_MODE
+    fi
+}
+
+fw_ref_for() {
+    if [ -n "${GNR_FW_REF_OVERRIDE:-}" ]; then
+        echo "$GNR_FW_REF_OVERRIDE"
+    else
+        env_get "$1" GNR_FRAMEWORK_REF
+    fi
 }
 
 # docker compose with the right files and variables
@@ -148,9 +173,11 @@ net_for() {
 dc() {
     local p="$1"; shift
     local files=(-f compose.project.yaml)
-    if [ "${USE_FRAMEWORK_SRC:-0}" = "1" ]; then
-        files+=(-f compose.framework.yaml)
-    fi
+    local fwmode; fwmode=$(fw_mode_for "$p")
+    case "$fwmode" in
+        local) files+=(-f compose.framework-local.yaml) ;;
+        git)   files+=(-f compose.framework-git.yaml) ;;
+    esac
     # GNR_PORT_DB=0 means "do not publish": the mapping has to be dropped,
     # since Docker reads port 0 as "pick a random host port".
     if [ "$(env_get "$p" GNR_PORT_DB)" = "0" ]; then
@@ -162,11 +189,13 @@ dc() {
         files+=(-f compose.network.yaml)
         # Passed on the command line so it takes precedence over the .env value
         # without rewriting the file.
-        GNR_NETWORK="$net" docker compose --env-file .env \
+        GNR_NETWORK="$net" GNR_FRAMEWORK_REF="$(fw_ref_for "$p")" \
+            docker compose --env-file .env \
             --env-file "$(env_file_for "$p")" "${files[@]}" "$@"
         return $?
     fi
-    docker compose --env-file .env --env-file "$(env_file_for "$p")" "${files[@]}" "$@"
+    GNR_FRAMEWORK_REF="$(fw_ref_for "$p")" \
+        docker compose --env-file .env --env-file "$(env_file_for "$p")" "${files[@]}" "$@"
 }
 
 # ---------------------------------------------------------------- port allocation
@@ -202,13 +231,83 @@ next_free_slot() {
     err "no free slot in ranges ${web_base}+ / ${debug_base}+ / ${db_base}+"
 }
 
+# Describes the framework a running project is actually using, reading the
+# container rather than the .env: an override passed to `up` must show here.
+#   image (<tag>)     from the official image
+#   local (<branch>)  bind-mounted host checkout
+#   git <ref>         clone in the per-project volume
+fw_runtime_desc() {
+    local p="$1" c="gnr-${1}-app"
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${c}$"; then
+        # Not running: fall back to what the .env asks for.
+        local m; m=$(env_get "$p" GNR_FRAMEWORK_MODE)
+        case "$m" in
+            local) echo "local" ;;
+            git)   echo "git $(env_get "$p" GNR_FRAMEWORK_REF)" ;;
+            *)     echo "image" ;;
+        esac
+        return 0
+    fi
+    # The mount is present only in local/git mode.
+    if ! docker exec "$c" test -d /home/genro/framework 2>/dev/null; then
+        local tag; tag=$(docker inspect "$c" --format '{{.Config.Image}}' 2>/dev/null | sed 's|.*:||')
+        echo "image (${tag:-latest})"
+        return 0
+    fi
+    local ref
+    ref=$(docker exec "$c" sh -c 'cd /home/genro/framework 2>/dev/null &&
+              { git symbolic-ref --short -q HEAD || git rev-parse --short HEAD; } 2>/dev/null' 2>/dev/null | tr -d "\r" | tail -1)
+    # A bind mount shows the host device; a named volume does not.
+    if docker inspect "$c" --format '{{range .Mounts}}{{if eq .Destination "/home/genro/framework"}}{{.Type}}{{end}}{{end}}' 2>/dev/null | grep -q bind; then
+        [ -n "$ref" ] && echo "local (${ref})" || echo "local"
+    else
+        [ -n "$ref" ] && echo "git ${ref}" || echo "git"
+    fi
+}
+
+# True when the running container does not match what the project .env asks
+# for, i.e. it was started with a `up --framework-*` override. The override
+# itself lives only in that shell, so it is inferred by comparing the two.
+fw_is_override() {
+    local p="$1" c="gnr-${1}-app"
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${c}$" || return 1
+
+    local want; want=$(env_get "$p" GNR_FRAMEWORK_MODE)
+    [ -n "$want" ] || want="image"
+
+    local actual="image"
+    if docker exec "$c" test -d /home/genro/framework 2>/dev/null; then
+        if docker inspect "$c" --format '{{range .Mounts}}{{if eq .Destination "/home/genro/framework"}}{{.Type}}{{end}}{{end}}' 2>/dev/null | grep -q bind; then
+            actual="local"
+        else
+            actual="git"
+        fi
+    fi
+    [ "$actual" != "$want" ] && return 0
+
+    # Same mode: in git mode the ref may still differ.
+    if [ "$actual" = "git" ]; then
+        local want_ref; want_ref=$(env_get "$p" GNR_FRAMEWORK_REF)
+        local has_ref
+        has_ref=$(docker exec "$c" sh -c 'cd /home/genro/framework 2>/dev/null &&
+                      { git symbolic-ref --short -q HEAD || git rev-parse --short HEAD; } 2>/dev/null' 2>/dev/null | tr -d "\r" | tail -1)
+        [ -n "$want_ref" ] && [ "$want_ref" != "$has_ref" ] && return 0
+    fi
+    return 1
+}
+
 # ---------------------------------------------------------------- commands
 cmd_new() {
-    local project="" instance="" network=""
+    local project="" instance="" network="" fwmode="" fwref=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --network) [ -n "${2:-}" ] || err "--network needs a name"; network="$2"; shift 2 ;;
             --network=*) network="${1#*=}"; shift ;;
+            --framework-local) fwmode="local"; shift ;;
+            --framework-git)
+                [ -n "${2:-}" ] || err "--framework-git needs a branch or commit"
+                fwmode="git"; fwref="$2"; shift 2 ;;
+            --framework-git=*) fwmode="git"; fwref="${1#*=}"; shift ;;
             -*) err "unknown option: $1" ;;
             *)
                 if [ -z "$project" ]; then project="$1"
@@ -217,7 +316,8 @@ cmd_new() {
                 fi; shift ;;
         esac
     done
-    [ -n "$project" ] || err "usage: ./gnrdev new <project> [instance] [--network <name>]"
+    [ -n "$project" ] || err "usage: ./gnrdev new <project> [instance] [--network <name>] [--framework-local|--framework-git <ref>]"
+    [ "$fwmode" = "git" ] && [ -z "$fwref" ] && err "--framework-git needs a branch or commit"
     local target="projects/${project}.env"
     [ -f "$target" ] && err "${target} already exists"
 
@@ -257,6 +357,13 @@ cmd_new() {
         -e "s/__PORT_DB__/${dbport}/g" \
         projects/_template.env > "$target"
 
+    if [ -n "$fwmode" ]; then
+        sed -i '' -e "s/^GNR_FRAMEWORK_MODE=.*/GNR_FRAMEWORK_MODE=${fwmode}/" \
+                  -e "s|^GNR_FRAMEWORK_REF=.*|GNR_FRAMEWORK_REF=${fwref}|" "$target" 2>/dev/null \
+            || sed -i -e "s/^GNR_FRAMEWORK_MODE=.*/GNR_FRAMEWORK_MODE=${fwmode}/" \
+                      -e "s|^GNR_FRAMEWORK_REF=.*|GNR_FRAMEWORK_REF=${fwref}|" "$target"
+    fi
+
     if [ -n "$network" ]; then
         sed -i '' "s/^GNR_NETWORK=.*/GNR_NETWORK=${network}/" "$target" 2>/dev/null \
             || sed -i "s/^GNR_NETWORK=.*/GNR_NETWORK=${network}/" "$target"
@@ -274,18 +381,29 @@ cmd_new() {
     echo "    debugpy  : ${debug}"
     echo "    database : ${dbport}"
     [ -n "$network" ] && echo "    network  : ${network}"
+    case "$fwmode" in
+        local) echo "    framework: local checkout" ;;
+        git)   echo "    framework: git ${fwref}" ;;
+    esac
     echo
     echo "Review ${target} (GNR_MAINPACKAGE, GNR_DEP_PROJECTS), then: ./gnrdev up ${project}"
 }
 
 cmd_up() {
     local project="${1:-}"; shift || true
-    [ -n "$project" ] || err "usage: ./gnrdev up <project> [--framework-src] [--build] [--no-dbmigrate] [--network <name>]"
+    [ -n "$project" ] || err "usage: ./gnrdev up <project> [--framework-local|--framework-git <ref>|--framework-image] [--build] [--no-dbmigrate] [--network <name>]"
     local build_args=()
     local do_dbmigrate=1
     while [ $# -gt 0 ]; do
         case "$1" in
-            --framework-src) export USE_FRAMEWORK_SRC=1; shift ;;
+            # Runtime-only: these never touch the project .env.
+            --framework-local) export GNR_FW_MODE_OVERRIDE=local; shift ;;
+            --framework-git)
+                [ -n "${2:-}" ] || err "--framework-git needs a branch or commit"
+                export GNR_FW_MODE_OVERRIDE=git GNR_FW_REF_OVERRIDE="$2"; shift 2 ;;
+            --framework-git=*)
+                export GNR_FW_MODE_OVERRIDE=git GNR_FW_REF_OVERRIDE="${1#*=}"; shift ;;
+            --framework-image) export GNR_FW_MODE_OVERRIDE=image; shift ;;
             --build) build_args+=(--build); shift ;;
             --no-dbmigrate) do_dbmigrate=0; shift ;;
             # Forces the network for this run only: the .env is left untouched.
@@ -300,12 +418,33 @@ cmd_up() {
             || err "network '${GNR_NETWORK_OVERRIDE}' does not exist: ./gnrdev network create ${GNR_NETWORK_OVERRIDE}"
         info "forcing network '${GNR_NETWORK_OVERRIDE}' (${c_dim}.env unchanged${c_off})"
     fi
+    local fwmode; fwmode=$(fw_mode_for "$project")
+    if [ -n "${GNR_FW_MODE_OVERRIDE:-}" ]; then
+        case "$fwmode" in
+            local) info "framework: local checkout (${c_dim}.env unchanged${c_off})" ;;
+            git)   info "framework: git $(fw_ref_for "$project") (${c_dim}.env unchanged${c_off})" ;;
+            *)     info "framework: official image (${c_dim}.env unchanged${c_off})" ;;
+        esac
+    fi
+    if [ "$fwmode" = "git" ] && [ -z "$(fw_ref_for "$project")" ]; then
+        err "framework mode 'git' needs a ref: set GNR_FRAMEWORK_REF in the project .env or pass --framework-git <ref>"
+    fi
+
     info "starting ${project}"
+    # Containers left over from a previous run can hold a reference to a network
+    # that no longer exists; compose then fails with "network <id> not found".
+    # Dropping the stopped ones first is safe: state lives in the volumes.
+    local stale
+    stale=$(docker ps -a --filter "name=^gnr-${project}-" --filter status=created \
+                      --filter status=exited --format '{{.Names}}' 2>/dev/null || true)
+    if [ -n "$stale" ]; then
+        # shellcheck disable=SC2086
+        docker rm -f $stale >/dev/null 2>&1 || true
+    fi
     dc "$project" up -d ${build_args[@]+"${build_args[@]}"}
 
-    local ef; ef=$(env_file_for "$project")
-    local web; web=$(grep '^GNR_PORT_WEB=' "$ef" | cut -d= -f2)
-    local inst; inst=$(grep '^GNR_INSTANCE=' "$ef" | cut -d= -f2)
+    local web; web=$(env_get "$project" GNR_PORT_WEB)
+    local inst; inst=$(env_get "$project" GNR_INSTANCE)
 
     # On an empty database the app cannot start: without a schema it fails with
     # 'relation "adm.adm_preference" does not exist'. Create it on first start.
@@ -335,8 +474,8 @@ split_target() {
     else
         TARGET_SERVICE="${spec#*.}"
         case "$TARGET_SERVICE" in
-            app|db|init-perms|framework-src) ;;
-            *) err "unknown service: '${TARGET_SERVICE}' (use app, db, init-perms or framework-src)" ;;
+            app|db|init-perms|fwgit) ;;
+            *) err "unknown service: '${TARGET_SERVICE}' (use app, db, init-perms or fwgit)" ;;
         esac
     fi
 }
@@ -372,10 +511,9 @@ cmd_gnr() {
 
 cmd_psql() {
     local p="${1:?usage: ./gnrdev psql <project>}"
-    local ef; ef=$(env_file_for "$p")
     local db user
-    db=$(grep '^GNR_DB_NAME=' "$ef" | cut -d= -f2)
-    user=$(grep '^GNR_DB_USER=' "$ef" | cut -d= -f2 || echo genro)
+    db=$(env_get "$p" GNR_DB_NAME)
+    user=$(env_get "$p" GNR_DB_USER)
     dc "$p" exec db psql -U "${user:-genro}" -d "$db"
 }
 
@@ -387,8 +525,8 @@ db_is_ready() {
     local p="$1"
     local ef; ef=$(env_file_for "$p")
     local db user
-    db=$(grep '^GNR_DB_NAME=' "$ef" | cut -d= -f2)
-    user=$(grep '^GNR_DB_USER=' "$ef" | cut -d= -f2)
+    db=$(env_get "$p" GNR_DB_NAME)
+    user=$(env_get "$p" GNR_DB_USER)
     dc "$p" exec -T db psql -U "${user:-genro}" -d "$db" -tAc \
         "select to_regclass('adm.adm_preference') is not null" 2>/dev/null \
         | tr -d '[:space:]' | grep -q '^t$'
@@ -397,8 +535,7 @@ db_is_ready() {
 # Single engine: `gnr db migrate` (NG, based on SqlMigrator).
 db_cmd() {
     local p="$1"; local mode="$2"
-    local ef; ef=$(env_file_for "$p")
-    local inst; inst=$(grep '^GNR_INSTANCE=' "$ef" | cut -d= -f2)
+    local inst; inst=$(env_get "$p" GNR_INSTANCE)
     local t; t=$(exec_tty_flag)
     if [ "$mode" = "check" ]; then
         dc "$p" exec ${t:+$t} app gnr db migrate -c -v "$inst"
@@ -423,11 +560,10 @@ cmd_dbcheck() {
 
 cmd_debug() {
     local p="${1:?usage: ./gnrdev debug <project>}"
-    local ef; ef=$(env_file_for "$p")
-    local inst dbg
-    inst=$(grep '^GNR_INSTANCE=' "$ef" | cut -d= -f2)
-    dbg=$(grep '^GNR_PORT_DEBUG=' "$ef" | cut -d= -f2)
-    local web; web=$(grep '^GNR_PORT_WEB=' "$ef" | cut -d= -f2)
+    local inst dbg web
+    inst=$(env_get "$p" GNR_INSTANCE)
+    dbg=$(env_get "$p" GNR_PORT_DEBUG)
+    web=$(env_get "$p" GNR_PORT_WEB)
     info "restarting ${inst} with debugpy"
     dc "$p" exec -d app supervisorctl stop gnrserve
     dc "$p" exec -d app supervisorctl start debugbridge
@@ -515,7 +651,7 @@ cmd_network() {
                 [ "$(basename "$f")" = "_template.env" ] && continue
                 local pj nt
                 pj=$(basename "$f" .env)
-                nt=$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1)
+                nt=$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1 || true)
                 if [ -z "$nt" ]; then
                     isolated="${isolated} ${pj}"
                 else
@@ -535,7 +671,7 @@ cmd_network() {
                     members=""
                     for f in projects/*.env; do
                         [ "$(basename "$f")" = "_template.env" ] && continue
-                        if [ "$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1)" = "$nt" ]; then
+                        if [ "$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1 || true)" = "$nt" ]; then
                             members="${members}$(basename "$f" .env), "
                         fi
                     done
@@ -720,22 +856,22 @@ cmd_ls() {
     shopt -s nullglob
     local files=(projects/*.env)
     [ ${#files[@]} -eq 0 ] && { echo "no project configured — run ./gnrdev new <project>"; return; }
-    printf "%-18s %-16s %-9s %-10s %-11s %-8s %-14s %s\n" \
-        PROJECT INSTANCE STATUS "WEB PORT" "DEBUG PORT" "DB PORT" NETWORK URL
+    printf "%-16s %-15s %-9s %-9s %-10s %-8s %-12s %-22s %s\n" \
+        PROJECT INSTANCE STATUS "WEB PORT" "DEBUG PORT" "DB PORT" NETWORK FRAMEWORK URL
     for f in "${files[@]}"; do
         [ "$(basename "$f")" = "_template.env" ] && continue
         local p i w dbp nt st dbg
-        p=$(grep '^GNR_PROJECT=' "$f" | cut -d= -f2)
-        i=$(grep '^GNR_INSTANCE=' "$f" | cut -d= -f2)
-        w=$(grep '^GNR_PORT_WEB=' "$f" | cut -d= -f2)
+        p=$(grep '^GNR_PROJECT=' "$f" | cut -d= -f2 || true)
+        i=$(grep '^GNR_INSTANCE=' "$f" | cut -d= -f2 || true)
+        w=$(grep '^GNR_PORT_WEB=' "$f" | cut -d= -f2 || true)
         # 0 or unset means the database port is not published
-        dbp=$(grep '^GNR_PORT_DB=' "$f" 2>/dev/null | cut -d= -f2 | tail -1)
+        dbp=$(grep '^GNR_PORT_DB=' "$f" 2>/dev/null | cut -d= -f2 | tail -1 || true)
         { [ -n "$dbp" ] && [ "$dbp" != "0" ]; } || dbp="-"
-        nt=$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1)
+        nt=$(grep '^GNR_NETWORK=' "$f" 2>/dev/null | cut -d= -f2- | tail -1 || true)
         [ -n "$nt" ] || nt="-"
         # Pad the plain word first, then colour it: escape sequences have no
         # width, so padding a coloured string would misalign the columns.
-        dbg="$(printf '%-11s' '-')"
+        dbg="$(printf '%-10s' '-')"
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^gnr-${p}-app$"; then
             st="${c_grn}$(printf '%-9s' running)${c_off}"
             # Debug mode leaves a `gnr web serve ... --debugpy` running outside
@@ -748,14 +884,23 @@ cmd_ls() {
                       *"web serve"*--debugpy*) exit 0;;
                     esac
                   done; exit 1' 2>/dev/null; then
-                local dport; dport=$(grep '^GNR_PORT_DEBUG=' "$f" 2>/dev/null | cut -d= -f2)
-                dbg="${c_mag}$(printf '%-11s' "${dport:-on}")${c_off}"
+                local dport; dport=$(grep '^GNR_PORT_DEBUG=' "$f" 2>/dev/null | cut -d= -f2 || true)
+                dbg="${c_mag}$(printf '%-10s' "${dport:-on}")${c_off}"
             fi
         else
             st="${c_dim}$(printf '%-9s' stopped)${c_off}"
         fi
-        printf "%-18s %-16s %s %-10s %s %-8s %-14s %s\n" \
-            "$p" "$i" "$st" "$w" "$dbg" "$dbp" "$nt" "http://localhost:${w}"
+        local fw fwcol; fw=$(fw_runtime_desc "$p")
+        if fw_is_override "$p"; then
+            # Pad the plain text, then colour: escapes have no width.
+            fwcol="$(printf '%-22s' "${fw} [OVR]")"
+            fwcol="${fwcol%"${fwcol##*[! ]}"}"
+            fwcol="${fw} ${c_ylw}[OVR]${c_off}$(printf '%*s' $(( 22 - ${#fw} - 6 )) '')"
+        else
+            fwcol="$(printf '%-22s' "$fw")"
+        fi
+        printf "%-16s %-15s %s %-9s %s %-8s %-12s %s %s\n" \
+            "$p" "$i" "$st" "$w" "$dbg" "$dbp" "$nt" "$fwcol" "http://localhost:${w}"
     done
 }
 

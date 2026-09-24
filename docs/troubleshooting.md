@@ -121,7 +121,7 @@ A volume initialised by 16 cannot be read by 18 regardless: upgrading
 `POSTGRES_TAG` on a project with data means `./gnrdev backup`, recreate, then
 `./gnrdev restore`.
 
-## --framework-src and the image copy of gnr
+## Framework from source and the image copy of gnr
 
 The official image installs the framework into
 `/usr/local/lib/python3.11/site-packages/gnr`, non-editable. That path is
@@ -131,8 +131,15 @@ loads the image copy — silently, with framework edits having no effect.
 
 The directory is therefore removed at **build time** (`FRAMEWORK_FROM_SRC=1` in
 `Dockerfile.dev`), since `site-packages` is not writable by the `genro` user at
-runtime. `compose.framework.yaml` tags that image `:fwsrc` so projects in normal
-mode never reuse it.
+runtime; the same build replaces `/home/genro/genropy` with a symlink to
+`/home/genro/framework`, so the static assets declared in `environment.xml`
+come from the same tree as the Python code. Both source modes tag that image
+`:fwsrc`, so projects on the official image never reuse it.
+
+`/home/genro/framework` is the single mount point: `compose.framework-local.yaml`
+bind-mounts the host checkout there, `compose.framework-git.yaml` mounts a
+per-project volume that the `fwgit` service clones and re-checks-out at every
+start.
 
 The install follows the installation guide profiles:
 `pip install --user -e <checkout>/gnrpy[developer,pgsql]`. The entrypoint then
@@ -145,6 +152,27 @@ if it does not.
 their colours. `gnrdev` passes `-T` only when its own stdout is not a terminal
 (`exec_tty_flag`), so colours survive interactive use while redirected output
 stays clean and scripted runs do not fail with "the input device is not a TTY".
+
+## Framework refs and stale networks
+
+`fwgit` resolves the ref before checking it out. A name that is neither a
+branch, a tag nor a commit stops the start with a readable error and, when the
+name looks like part of an existing branch, the candidates:
+
+```
+[fwgit] ERROR: '496-runtime-model' is not a branch, tag or commit of ...
+[fwgit] did you mean:
+[fwgit]   feature/496-runtime-model
+```
+
+Without the check git reports `--detach does not take a path argument`, which
+says nothing about the ref being missing. Branch names in the Genropy
+repository are often prefixed (`feature/`, `fix/`), so the full name is needed.
+
+Containers left from a previous run can also keep a reference to a network that
+no longer exists, and compose then fails with `network <id> not found`. `up`
+removes stopped containers of the project before starting: their state lives in
+the volumes, so nothing is lost.
 
 ## Notes on the official image
 

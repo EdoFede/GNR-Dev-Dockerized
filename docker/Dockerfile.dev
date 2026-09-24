@@ -45,14 +45,19 @@ RUN pip install --no-cache-dir watchdog uv
 COPY docker/polling_observer.py /usr/local/lib/python3.11/site-packages/zz_gnrdev_polling.py
 RUN echo "import zz_gnrdev_polling" > /usr/local/lib/python3.11/site-packages/zz_gnrdev_polling.pth
 
-# With --framework-src the framework comes from a bind-mounted checkout. The
+# In local/git mode the framework comes from /home/genro/framework. The
 # copy the official image installs into site-packages would shadow it, because
 # that path is searched before the editable finder, so it is dropped here: at
 # build time we are still root, at runtime the genro user cannot write there.
+# It also replaces /home/genro/genropy with a symlink to the mounted framework,
+# so the static assets declared in environment.xml (dojo, resources, webtools)
+# come from the same tree as the Python code instead of the image.
 ARG FRAMEWORK_FROM_SRC=0
 RUN if [ "$FRAMEWORK_FROM_SRC" = "1" ]; then \
         rm -rf /usr/local/lib/python3.11/site-packages/gnr \
-               /usr/local/lib/python3.11/site-packages/genropy-*.dist-info; \
+               /usr/local/lib/python3.11/site-packages/genropy-*.dist-info \
+               /home/genro/genropy && \
+        ln -s /home/genro/framework /home/genro/genropy; \
     fi
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

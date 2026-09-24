@@ -69,9 +69,9 @@ $ ./gnrdev up sandbox
 $ ./gnrdev new edodevel && ./gnrdev up edodevel
 
 $ ./gnrdev ls
-PROJECT            INSTANCE         STATUS    WEB PORT   DEBUG PORT  DB PORT  NETWORK        URL
-edodevel           edodevel         running   9001       -           9201     -              http://localhost:9001
-sandbox            sandboxpg        running   9000       -           9200     -              http://localhost:9000
+PROJECT          INSTANCE        STATUS    WEB PORT  DEBUG PORT DB PORT  NETWORK      FRAMEWORK              URL
+edodevel         edodevel        running   9001      -          9201     -            image (latest)         http://localhost:9001
+sandbox          sandboxpg       running   9000      -          9200     -            local (master)         http://localhost:9000
 ```
 
 Gli stack sono del tutto indipendenti: fermarne o romperne uno non tocca gli
@@ -109,7 +109,7 @@ un singolo container:
 ./gnrdev restart sandbox.db            # riavvia solo il database
 ```
 
-Servizi: `app`, `db` (piu' `init-perms` e `framework-src`).
+Servizi: `app`, `db` (piu' `init-perms`, `init-fwgit` e `fwgit`).
 
 I container hanno hostname uguale al nome del container, quindi il prompt dice
 dove ti trovi: `genro@gnr-sandbox-app`.
@@ -248,9 +248,9 @@ $ ./gnrdev network rm gnrdev          # stacca prima i progetti
 Anche `gnrdev ls` mostra la rete di ogni progetto:
 
 ```
-PROJECT            INSTANCE         STATUS    WEB PORT   DEBUG PORT  DB PORT  NETWORK        URL
-edodevel           edodevel         running   9001       -           9201     gnrdev         http://localhost:9001
-sandbox            sandboxpg        running   9000       -           9200     gnrdev         http://localhost:9000
+PROJECT          INSTANCE        STATUS    WEB PORT  DEBUG PORT DB PORT  NETWORK      FRAMEWORK              URL
+edodevel         edodevel        running   9001      -          9201     gnrdev       image (latest)         http://localhost:9001
+sandbox          sandboxpg       running   9000      -          9200     gnrdev       git develop            http://localhost:9000
 ```
 
 Lasciare `GNR_NETWORK` vuoto mantiene il progetto isolato.
@@ -316,27 +316,52 @@ Due cose da sapere:
 
 ## Versione del framework
 
-`GENROPY_TAG` in `.env` fissa il tag dell'immagine ufficiale (`latest`,
-`develop`, o una versione come `26.05.05`). Dopo averlo cambiato:
-`./gnrdev rebuild <progetto>`.
+Di default il framework viene dall'immagine ufficiale, al tag indicato da
+`GENROPY_TAG` in `.env` (`latest`, `develop`, o una versione come `26.05.05`).
+Dopo averlo cambiato: `./gnrdev rebuild <progetto>`.
 
-Per lavorare sul framework stesso, o per usare un branch/commit specifico:
+Esistono altre due modalita', e un progetto puo' essere fissato su una di esse
+gia' alla creazione:
 
 ```bash
-./gnrdev up <progetto> --framework-src
+./gnrdev new <progetto> --framework-local        # il checkout su questo host
+./gnrdev new <progetto> --framework-git develop  # un clone di quel branch/commit
 ```
 
-Monta il checkout indicato da `HOST_GENROPY`, opzionalmente posizionato su
-`GNR_FRAMEWORK_REF`, e lo installa in editable mode con i profili
-`[developer,pgsql]` della guida di installazione: le modifiche al framework
-hanno effetto immediato. Da' accesso anche alle versioni di dojo assenti
-nell'immagine ufficiale.
+**`--framework-local`** bind-monta `HOST_GENROPY` e lo installa in editable
+mode: le modifiche al framework hanno effetto immediato. Il checkout dell'host
+viene usato com'e', nessun comando git lo tocca. Da' accesso anche alle versioni
+di dojo assenti nell'immagine ufficiale.
 
-Costruisce un'immagine separata (tag `:fwsrc`) con il framework rimosso da
-`site-packages`, che altrimenti avrebbe la precedenza sul checkout montato.
-L'entrypoint verifica che il checkout sia davvero in uso e fallisce in caso
-contrario.
+**`--framework-git <ref>`** tiene un clone del repository ufficiale in un volume
+per progetto, isolato dall'host. Il ref viene fetchato e ri-checkoutato **a ogni
+avvio**, quindi il container resta allineato a quanto pubblicato nel repository,
+e due progetti possono stare su ref diversi senza conflitti. Con
+`GNR_FRAMEWORK_REPO` nel `.env` del progetto si punta a un altro repository.
 
+Entrambe le modalita' costruiscono un'immagine separata (`:fwsrc`) con il
+framework rimosso da `site-packages`, che altrimenti avrebbe la precedenza su
+quello montato; l'entrypoint fallisce esplicitamente se il checkout non e'
+quello realmente importato.
+
+`up` cambia la modalita' per un singolo avvio, senza toccare il `.env`:
+
+```bash
+./gnrdev up <progetto> --framework-local
+./gnrdev up <progetto> --framework-git 26.05.05
+./gnrdev up <progetto> --framework-image     # torna all'immagine ufficiale
+```
+
+L'avvio successivo senza flag torna a quanto dice il `.env`.
+
+`gnrdev ls` mostra nella colonna FRAMEWORK cosa sta **effettivamente girando**
+in ogni progetto — `image (<tag>)`, `local (<branch>)` o `git <ref>` — letto dal
+container. Il marcatore `[OVR]` segnala che il container non corrisponde al
+`.env` del progetto, cioe' e' stato avviato con uno dei flag qui sopra:
+
+```
+sandbox          ...   git master [OVR]       http://localhost:9000
+```
 ## Dipendenze cross-progetto
 
 Si dichiarano normalmente nella configurazione dell'istanza con

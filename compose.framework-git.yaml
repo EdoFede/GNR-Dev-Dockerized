@@ -1,0 +1,96 @@
+# Applied by `--framework-git <ref>` (or GNR_FRAMEWORK_MODE=git).
+#
+# Runs the framework from a clone kept in a per-project named volume, isolated
+# from the host checkout: pinning a ref here never moves the host repository,
+# and two projects can sit on different refs.
+#
+# The `fwgit` service fetches and checks out GNR_FRAMEWORK_REF on every start,
+# so the container always matches what the upstream repository publishes.
+
+services:
+  # Named volumes are created root-owned; fix it before fwgit clones into it.
+  init-fwgit:
+    image: busybox:latest
+    container_name: gnr-${GNR_PROJECT}-init-fwgit
+    user: "0:0"
+    command: sh -c "chown -R ${HOST_UID:-501}:${HOST_GID:-20} /framework"
+    volumes:
+      - fwgit:/framework
+
+  # Clones on first use, then fetches and re-checks-out the ref every start.
+  # The volume may keep build leftovers: only the checked-out ref matters.
+  fwgit:
+    image: alpine/git:latest
+    container_name: gnr-${GNR_PROJECT}-fwgit
+    user: "${HOST_UID:-501}:${HOST_GID:-20}"
+    depends_on:
+      init-fwgit:
+        condition: service_completed_successfully
+    volumes:
+      - fwgit:/framework
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        REPO="${GNR_FRAMEWORK_REPO:-https://github.com/genropy/genropy.git}"
+        REF="${GNR_FRAMEWORK_REF:-}"
+        [ -n "$$REF" ] || { echo "[fwgit] GNR_FRAMEWORK_REF is not set"; exit 1; }
+        if [ ! -d /framework/.git ]; then
+          echo "[fwgit] cloning $$REPO"
+          git clone --filter=blob:none "$$REPO" /framework
+        fi
+        cd /framework
+        git remote set-url origin "$$REPO"
+        echo "[fwgit] fetching $$REF"
+        git fetch --all --tags --prune --quiet
+
+        # Resolve the ref before checking it out, so a name that does not exist
+        # produces a readable error instead of git's
+        # "--detach does not take a path argument".
+        if git show-ref --verify --quiet "refs/remotes/origin/$$REF"; then
+          git checkout --quiet -B "$$REF" "origin/$$REF"        # branch: track it
+        elif git rev-parse --verify --quiet "$$REF^{commit}" >/dev/null; then
+          git checkout --quiet --detach "$$REF"                 # tag or sha
+        else
+          echo "[fwgit] ERROR: '$$REF' is not a branch, tag or commit of $$REPO"
+          # Branch names are often prefixed (feature/, fix/, ...): show the ones
+          # that contain what was asked for, which is usually the missing part.
+          near=$$(git branch -r --format='%(refname:short)' \
+                  | sed 's|^origin/||' | grep -i -- "$$REF" | head -5)
+          if [ -n "$$near" ]; then
+            echo "[fwgit] did you mean:"
+            echo "$$near" | sed 's/^/[fwgit]   /'
+          else
+            echo "[fwgit] no branch or tag matches '$$REF'"
+            echo "[fwgit] list them with: git ls-remote --heads $$REPO"
+          fi
+          exit 1
+        fi
+        echo "[fwgit] now at $$(git rev-parse --short HEAD) ($$REF)"
+
+  app:
+    # Same image as --framework-local: the framework is removed from
+    # site-packages so it cannot shadow the mounted one.
+    image: gnrdev/${GNR_PROJECT}:fwsrc
+    build:
+      args:
+        FRAMEWORK_FROM_SRC: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+      init-perms:
+        condition: service_completed_successfully
+      fwgit:
+        condition: service_completed_successfully
+    volumes:
+      - ./gnrfolder:/home/genro/.gnr:ro
+      - ${HOST_PROJECTS}:/home/genro/genropy_projects
+      - ${HOST_GNREXTRA}:/home/genro/gnrextra_projects
+      - fwgit:/home/genro/framework
+      - pylibs:/home/genro/.local
+    environment:
+      GNR_FRAMEWORK_EDITABLE: "1"
+
+volumes:
+  fwgit:

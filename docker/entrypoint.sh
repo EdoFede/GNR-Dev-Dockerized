@@ -65,7 +65,7 @@ if [ "${GNR_SKIP_CHECKDEP:-0}" != "1" ]; then
     fi
 fi
 
-# --- 3b. editable framework (only with --framework-src) -------------------------
+# --- 3b. editable framework (local or git mode) ---------------------------------
 # The image ships gnr/ inside /usr/local/.../site-packages. That copy comes
 # FIRST on sys.path, so an editable install alone is not enough: pip would
 # report the checkout while `import gnr` still loads the image copy. The
@@ -74,10 +74,10 @@ fi
 # Profiles follow the installation guide: [developer,pgsql]. --no-deps is not
 # used, so the extras resolve; the heavy native deps are already in the image
 # and pip leaves them alone.
-FW_SRC=/home/genro/genropy/gnrpy
+FW_SRC=/home/genro/framework/gnrpy
 if [ "${GNR_FRAMEWORK_EDITABLE:-0}" = "1" ]; then
     if [ ! -f "${FW_SRC}/pyproject.toml" ]; then
-        fail "GNR_FRAMEWORK_EDITABLE=1 but ${FW_SRC}/pyproject.toml is missing (check HOST_GENROPY)"
+        fail "GNR_FRAMEWORK_EDITABLE=1 but ${FW_SRC}/pyproject.toml is missing (check the framework mount)"
     fi
     # The image copy of gnr/ is removed at build time (see Dockerfile.dev):
     # site-packages is not writable by the genro user, so it cannot be done here.
@@ -100,7 +100,7 @@ if [ "${GNR_FRAMEWORK_EDITABLE:-0}" = "1" ]; then
     # still resolves elsewhere.
     actual=$(python3 -c 'import gnr,os;print(os.path.realpath(os.path.dirname(gnr.__file__)))' 2>/dev/null || true)
     case "$actual" in
-        /home/genro/genropy/*) log "framework in use: ${actual}" ;;
+        /home/genro/framework/*) log "framework in use: ${actual}" ;;
         *) fail "framework still loaded from ${actual:-unknown}, not from the mounted checkout" ;;
     esac
 fi

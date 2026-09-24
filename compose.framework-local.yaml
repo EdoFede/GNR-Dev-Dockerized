@@ -1,0 +1,33 @@
+# Applied by `--framework-local` (or GNR_FRAMEWORK_MODE=local).
+#
+# Runs the framework from the checkout on the host, bind-mounted read-write:
+# edits made on the host take effect in the container immediately. Use it to
+# work on the framework itself.
+#
+# The checkout is used as it is: no git operation is performed on it, so the
+# host repository is never moved under your feet. To pin a branch or commit
+# without touching the host, use `--framework-git` instead.
+
+services:
+  app:
+    # Separate tag: this image has the framework removed from site-packages and
+    # must not be reused by projects running in normal mode.
+    image: gnrdev/${GNR_PROJECT}:fwsrc
+    build:
+      args:
+        FRAMEWORK_FROM_SRC: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+      init-perms:
+        condition: service_completed_successfully
+    volumes:
+      - ./gnrfolder:/home/genro/.gnr:ro
+      - ${HOST_PROJECTS}:/home/genro/genropy_projects
+      - ${HOST_GNREXTRA}:/home/genro/gnrextra_projects
+      - ${HOST_GENROPY}:/home/genro/framework
+      - pylibs:/home/genro/.local
+    environment:
+      # Read by the entrypoint: installs the framework editable from
+      # /home/genro/framework.
+      GNR_FRAMEWORK_EDITABLE: "1"
