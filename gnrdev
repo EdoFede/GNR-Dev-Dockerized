@@ -247,6 +247,29 @@ next_free_slot() {
     err "no free slot in ranges ${web_base}+ / ${debug_base}+ / ${db_base}+"
 }
 
+# Source of the framework in a running app, from the mount over
+# /home/genro/genropy: "local" (bind, host checkout), "git" (named volume),
+# "image" (no mount).
+fw_mount_mode() {
+    local t
+    t=$(docker inspect "gnr-${1}-app" --format \
+        '{{range .Mounts}}{{if eq .Destination "/home/genro/genropy"}}{{.Type}}{{end}}{{end}}' 2>/dev/null)
+    case "$t" in
+        bind)   echo local ;;
+        volume) echo git ;;
+        *)      echo image ;;
+    esac
+}
+
+# Branch (or short commit when detached) of the mounted framework. The
+# checkout belongs to the host user, not to the exec user: safe.directory
+# keeps git from refusing it as "dubious ownership".
+fw_mount_ref() {
+    local git=(docker exec "gnr-${1}-app" git -c safe.directory='*' -C /home/genro/genropy)
+    { "${git[@]}" symbolic-ref --short -q HEAD || "${git[@]}" rev-parse --short HEAD; } \
+        2>/dev/null | tr -d "\r" | tail -1 || true
+}
+
 # Describes the framework a running project is actually using, reading the
 # container rather than the .env: an override passed to `up` must show here.
 #   image (<tag>)     from the official image
@@ -264,17 +287,14 @@ fw_runtime_desc() {
         esac
         return 0
     fi
-    # The mount is present only in local/git mode.
-    if ! docker exec "$c" test -d /home/genro/framework 2>/dev/null; then
+    local mode ref; mode=$(fw_mount_mode "$p")
+    if [ "$mode" = "image" ]; then
         local tag; tag=$(docker inspect "$c" --format '{{.Config.Image}}' 2>/dev/null | sed 's|.*:||')
         echo "image (${tag:-latest})"
         return 0
     fi
-    local ref
-    ref=$(docker exec "$c" sh -c 'cd /home/genro/framework 2>/dev/null &&
-              { git symbolic-ref --short -q HEAD || git rev-parse --short HEAD; } 2>/dev/null' 2>/dev/null | tr -d "\r" | tail -1)
-    # A bind mount shows the host device; a named volume does not.
-    if docker inspect "$c" --format '{{range .Mounts}}{{if eq .Destination "/home/genro/framework"}}{{.Type}}{{end}}{{end}}' 2>/dev/null | grep -q bind; then
+    ref=$(fw_mount_ref "$p")
+    if [ "$mode" = "local" ]; then
         [ -n "$ref" ] && echo "local (${ref})" || echo "local"
     else
         [ -n "$ref" ] && echo "git ${ref}" || echo "git"
@@ -290,24 +310,13 @@ fw_is_override() {
 
     local want; want=$(env_get "$p" GNR_FRAMEWORK_MODE)
     [ -n "$want" ] || want="image"
-
-    local actual="image"
-    if docker exec "$c" test -d /home/genro/framework 2>/dev/null; then
-        if docker inspect "$c" --format '{{range .Mounts}}{{if eq .Destination "/home/genro/framework"}}{{.Type}}{{end}}{{end}}' 2>/dev/null | grep -q bind; then
-            actual="local"
-        else
-            actual="git"
-        fi
-    fi
+    local actual; actual=$(fw_mount_mode "$p")
     [ "$actual" != "$want" ] && return 0
 
     # Same mode: in git mode the ref may still differ.
     if [ "$actual" = "git" ]; then
         local want_ref; want_ref=$(env_get "$p" GNR_FRAMEWORK_REF)
-        local has_ref
-        has_ref=$(docker exec "$c" sh -c 'cd /home/genro/framework 2>/dev/null &&
-                      { git symbolic-ref --short -q HEAD || git rev-parse --short HEAD; } 2>/dev/null' 2>/dev/null | tr -d "\r" | tail -1)
-        [ -n "$want_ref" ] && [ "$want_ref" != "$has_ref" ] && return 0
+        [ -n "$want_ref" ] && [ "$want_ref" != "$(fw_mount_ref "$p")" ] && return 0
     fi
     return 1
 }

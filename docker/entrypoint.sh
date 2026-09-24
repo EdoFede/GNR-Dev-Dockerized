@@ -5,6 +5,7 @@
 #   0. runtime user          -> host uid/gid, then drop root
 #   1. clear sitedaemon.xml  -> stale PIDs after an unclean stop
 #   2. Python dependencies   -> incremental, hash-stamped
+#  2b. framework from source -> local/git mode only
 #   3. check {GNR_*} vars    -> fail fast instead of a broken config
 #
 # The database is not waited for here: compose starts app only once the db
@@ -33,12 +34,15 @@ if [ "$(id -u)" = "0" ]; then
         chown "$uid:$gid" /home/genro /home/genro/.local
         # Loading a package's startup data unpacks startup_data.gz into a .pik
         # next to it, i.e. inside the framework tree. Only those directories
-        # are handed over; ones already owned (a mounted checkout) are skipped.
-        find /home/genro/genropy/projects -name startup_data.gz 2>/dev/null \
-            | while read -r f; do
-                d="$(dirname "$f")"
-                [ "$(stat -c %u "$d")" = "$uid" ] || chown "$uid:$gid" "$d"
-            done
+        # of the image copy are handed over: a mounted checkout (local/git
+        # mode) is never chowned, it already belongs to the right user.
+        if ! mountpoint -q /home/genro/genropy; then
+            find /home/genro/genropy/projects -name startup_data.gz 2>/dev/null \
+                | while read -r f; do
+                    d="$(dirname "$f")"
+                    [ "$(stat -c %u "$d")" = "$uid" ] || chown "$uid:$gid" "$d"
+                done
+        fi
         # stdout/stderr are root-owned 0600 pipes: supervisord reopens them by
         # path (/dev/stdout) and would get EACCES once root is dropped.
         chown "$uid" "/proc/$$/fd/1" "/proc/$$/fd/2" 2>/dev/null || true
@@ -92,44 +96,49 @@ if [ "${GNR_SKIP_CHECKDEP:-0}" != "1" ]; then
     fi
 fi
 
-# --- 2b. editable framework (local or git mode) ---------------------------------
-# The image ships gnr/ inside /usr/local/.../site-packages. That copy comes
-# FIRST on sys.path, so an editable install alone is not enough: pip would
-# report the checkout while `import gnr` still loads the image copy. The
-# directory has to go.
+# --- 2b. framework from source (local or git mode) -----------------------------
+# The checkout is mounted over /home/genro/genropy, so the static assets
+# declared in environment.xml (dojo, gnrjs, resources) come from it with no
+# path change. For the Python code, compose puts its gnrpy/ first on
+# PYTHONPATH, ahead of the copy the image installs into site-packages.
 #
-# Profiles follow the installation guide: [developer,pgsql]. --no-deps is not
-# used, so the extras resolve; the heavy native deps are already in the image
-# and pip leaves them alone.
-FW_SRC=/home/genro/framework/gnrpy
+# The editable install is still done, into the pylibs volume: it brings in the
+# dependencies the checkout declares (profiles [developer,pgsql], as in the
+# installation guide) and the metadata (version, entry points) matching it.
+# Stamped on pyproject.toml, so a ref with different dependencies reinstalls.
+FW_SRC=/home/genro/genropy/gnrpy
+STAMP_FW="/home/genro/.local/.fw-editable"
 if [ "${GNR_FRAMEWORK_EDITABLE:-0}" = "1" ]; then
     if [ ! -f "${FW_SRC}/pyproject.toml" ]; then
         fail "GNR_FRAMEWORK_EDITABLE=1 but ${FW_SRC}/pyproject.toml is missing (check the framework mount)"
     fi
-    # The image copy of gnr/ is removed at build time (see Dockerfile.dev):
-    # site-packages is not writable by the genro user, so it cannot be done here.
-
-    # Stamped on the checkout path: a different mount must reinstall.
-    STAMP_FW="/home/genro/.local/.fw-editable"
-    want="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$FW_SRC")"
+    want="$(sha256sum "${FW_SRC}/pyproject.toml" | cut -d' ' -f1)"
     if [ "$(cat "${STAMP_FW}" 2>/dev/null || true)" != "$want" ]; then
         log "installing the framework editable from the mounted checkout"
-        if pip install --user --quiet -e "${FW_SRC}[developer,pgsql]"; then
-            mkdir -p "$(dirname "${STAMP_FW}")" && echo "$want" > "${STAMP_FW}"
+        # Without PYTHONPATH: it would show pip the egg-info setuptools leaves in
+        # gnrpy/ as one more installed genropy, and pip then tries to remove
+        # the image's copy (Permission denied on /usr/local/bin/gnr).
+        if env -u PYTHONPATH pip install --user --quiet -e "${FW_SRC}[developer,pgsql]"; then
+            echo "$want" > "${STAMP_FW}"
         else
             fail "editable install of the framework failed"
         fi
     else
-        log "framework already editable"
+        log "framework dependencies unchanged"
     fi
 
-    # Verify it actually took: pip can report the checkout while the import
-    # still resolves elsewhere.
+    # Verify it actually took: the import must resolve into the mount.
     actual=$(python3 -c 'import gnr,os;print(os.path.realpath(os.path.dirname(gnr.__file__)))' 2>/dev/null || true)
     case "$actual" in
-        /home/genro/framework/*) log "framework in use: ${actual}" ;;
-        *) fail "framework still loaded from ${actual:-unknown}, not from the mounted checkout" ;;
+        "${FW_SRC}"/*) log "framework in use: ${actual}" ;;
+        *) fail "framework loaded from ${actual:-unknown}, not from the mounted checkout" ;;
     esac
+elif [ -f "${STAMP_FW}" ]; then
+    # Back to the image framework: the editable install left in pylibs would
+    # shadow the image's metadata (user site comes before site-packages).
+    log "removing the editable framework left by a previous source mode"
+    env -u PYTHONPATH pip uninstall --quiet -y genropy >/dev/null 2>&1 || true
+    rm -f "${STAMP_FW}"
 fi
 
 # --- 3. fail fast on missing placeholders ---------------------------------------

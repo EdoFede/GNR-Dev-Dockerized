@@ -10,24 +10,13 @@
 
 services:
   app:
-    # Separate tag: this image has the framework removed from site-packages and
-    # must not be reused by projects running in normal mode.
-    image: gnrdev/${GNR_PROJECT}:fwsrc
-    build:
-      args:
-        FRAMEWORK_FROM_SRC: "1"
-    depends_on:
-      db:
-        condition: service_healthy
-      init-perms:
-        condition: service_completed_successfully
     volumes:
-      - ./gnrfolder:/home/genro/.gnr:ro
-      - ${HOST_PROJECTS}:/home/genro/genropy_projects
-      - ${HOST_GNREXTRA}:/home/genro/gnrextra_projects
-      - ${HOST_GENROPY}:/home/genro/framework
-      - pylibs:/home/genro/.local
+      # Over the image copy: environment.xml already points here for the
+      # static assets, so they follow the checkout too.
+      - ${HOST_GENROPY}:/home/genro/genropy
     environment:
-      # Read by the entrypoint: installs the framework editable from
-      # /home/genro/framework.
+      # Ahead of site-packages, where the image installs its own copy of gnr.
+      PYTHONPATH: /home/genro/genropy/gnrpy
+      # Read by the entrypoint: editable install for the checkout's
+      # dependencies, then a check that gnr is imported from the mount.
       GNR_FRAMEWORK_EDITABLE: "1"
