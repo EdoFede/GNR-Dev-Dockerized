@@ -193,6 +193,12 @@ dc() {
     if [ "$(env_get "$p" GNR_PORT_DB)" = "0" ]; then
         files+=(-f compose.nodb.yaml)
     fi
+    # Before 18 the data path is different: see compose.pg-legacy.yaml.
+    # Only a leading major version counts; `latest` and the like are 18+.
+    local pgtag; pgtag=$(env_get "$p" POSTGRES_TAG)
+    case "$pgtag" in
+        [0-9]*) [ "${pgtag%%[!0-9]*}" -lt 18 ] && files+=(-f compose.pg-legacy.yaml) ;;
+    esac
     # The shared-network override only applies when a network is in effect.
     local net; net=$(net_for "$p")
     if [ -n "$net" ]; then
@@ -458,6 +464,7 @@ cmd_up() {
     # 'relation "adm.adm_preference" does not exist'. Create it on first start.
     if [ "$do_dbmigrate" = "1" ] && ! db_is_ready "$project"; then
         info "empty database: creating the schema (one-off, may take a minute)"
+        wait_app_ready "$project" || warn "app setup still running after 5 minutes"
         if db_cmd "$project" apply; then
             dc "$project" restart app >/dev/null 2>&1
         else
@@ -469,6 +476,21 @@ cmd_up() {
     info "ready: ${c_grn}http://localhost:${web}${c_off}"
     echo "${c_dim}    logs:  ./gnrdev logs ${project} -f${c_off}"
     echo "${c_dim}    shell: ./gnrdev shell ${project}${c_off}"
+}
+
+# `up -d` returns as soon as app is started, while its entrypoint may still be
+# installing dependencies: a `gnr` command run then fails on missing modules.
+# The entrypoint ends by exec-ing supervisord, so PID 1 becoming supervisord
+# means the setup is over. Matched on its path: while the entrypoint runs,
+# PID 1 is the shell, with a bare "supervisord" among its arguments.
+wait_app_ready() {
+    local c="gnr-${1}-app" i
+    for i in $(seq 1 300); do
+        docker exec "$c" sh -c 'tr "\0" " " < /proc/1/cmdline | grep -q "bin/supervisord"' \
+            2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
 }
 
 # Accepts both "project" and "project.service" (e.g. sandbox.db).

@@ -20,8 +20,8 @@ services:
     volumes:
       # PostgreSQL 18+ wants a single mount at /var/lib/postgresql and keeps the
       # data in a subdirectory; mounting .../data directly makes it refuse to
-      # start. Existing volumes created for 16 are not readable by 18: see
-      # docs/troubleshooting.md.
+      # start. Older versions need .../data instead: gnrdev swaps it in with
+      # compose.pg-legacy.yaml. See docs/troubleshooting.md.
       - pgdata:/var/lib/postgresql
     ports:
       # Published so external clients can reach it. Set GNR_PORT_DB=0 in the
