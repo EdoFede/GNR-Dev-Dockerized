@@ -1,14 +1,44 @@
 #!/bin/bash
-# Entrypoint of the "app" container.
+# Entrypoint of the "app" container, mounted from docker/ into the official
+# image (nothing is built).
 #
+#   0. runtime user          -> host uid/gid, then drop root
 #   1. clear sitedaemon.xml  -> stale PIDs after an unclean stop
-#   2. wait for the database -> depends_on does not mean PG accepts connections
-#   3. Python dependencies   -> incremental, hash-stamped
-#   4. check {GNR_*} vars    -> fail fast instead of a broken config
+#   2. Python dependencies   -> incremental, hash-stamped
+#   3. check {GNR_*} vars    -> fail fast instead of a broken config
+#
+# The database is not waited for here: compose starts app only once the db
+# healthcheck (pg_isready) passes.
 set -euo pipefail
 
 log() { echo "[entrypoint] $*"; }
 fail() { echo "[entrypoint] ERROR: $*" >&2; exit 1; }
+
+# --- 0. runtime user ------------------------------------------------------------
+# The official image runs as root. We run as the host uid/gid instead, so files
+# written into the bind mounts (instance tmp files, sitedaemon.xml, ...) belong
+# to the host user on Linux; on macOS the runtime maps ownership anyway.
+#
+# A passwd entry is added rather than renumbering `genro`: `usermod -u` chowns
+# the whole home, copying the framework tree into every container layer. Only
+# the two directories the user must write to are chowned, not recursively.
+# The container layer survives restarts, so every step is idempotent.
+if [ "$(id -u)" = "0" ]; then
+    uid="${HOST_UID:-0}"
+    gid="${HOST_GID:-${uid}}"
+    if [ "$uid" != "0" ]; then
+        getent group "$gid" >/dev/null || groupadd -g "$gid" gnrdev
+        getent passwd "$uid" >/dev/null \
+            || useradd -M -o -u "$uid" -g "$gid" -d /home/genro -s /bin/bash gnrdev
+        chown "$uid:$gid" /home/genro /home/genro/.local
+        # stdout/stderr are root-owned 0600 pipes: supervisord reopens them by
+        # path (/dev/stdout) and would get EACCES once root is dropped.
+        chown "$uid" "/proc/$$/fd/1" "/proc/$$/fd/2" 2>/dev/null || true
+        log "running as $(getent passwd "$uid" | cut -d: -f1) (${uid}:${gid})"
+        exec setpriv --reuid="$uid" --regid="$gid" --init-groups "$0" "$@"
+    fi
+    log "WARNING: HOST_UID is unset or 0, running as root"
+fi
 
 : "${GNR_PROJECT:?GNR_PROJECT is not set}"
 : "${GNR_INSTANCE:?GNR_INSTANCE is not set}"
@@ -28,21 +58,7 @@ for sitedir in "${INSTANCE_ROOT}/site" "${PROJECT_ROOT}/sites/${GNR_INSTANCE}"; 
     fi
 done
 
-# --- 2. wait for the database ---------------------------------------------------
-if [ "${GNR_DB_IMPLEMENTATION:-postgres}" = "postgres" ] && [ -n "${GNR_DB_HOST:-}" ]; then
-    log "waiting for postgres on ${GNR_DB_HOST}:${GNR_DB_PORT:-5432}"
-    for i in $(seq 1 60); do
-        if pg_isready -h "${GNR_DB_HOST}" -p "${GNR_DB_PORT:-5432}" \
-                      -U "${GNR_DB_USER:-genro}" -q 2>/dev/null; then
-            log "postgres ready"
-            break
-        fi
-        [ "$i" = "60" ] && fail "postgres unreachable after 60 attempts"
-        sleep 1
-    done
-fi
-
-# --- 3. Python dependencies of the instance -------------------------------------
+# --- 2. Python dependencies of the instance -------------------------------------
 # `gnr app checkdep` resolves the requirements of the packages ACTUALLY enabled
 # in the instance (gnrapp.py:1037), wherever they live — including packages
 # inside the image (gnrcore:email -> mail-parser), which scanning the mounted
@@ -65,7 +81,7 @@ if [ "${GNR_SKIP_CHECKDEP:-0}" != "1" ]; then
     fi
 fi
 
-# --- 3b. editable framework (local or git mode) ---------------------------------
+# --- 2b. editable framework (local or git mode) ---------------------------------
 # The image ships gnr/ inside /usr/local/.../site-packages. That copy comes
 # FIRST on sys.path, so an editable install alone is not enough: pip would
 # report the checkout while `import gnr` still loads the image copy. The
@@ -105,7 +121,7 @@ if [ "${GNR_FRAMEWORK_EDITABLE:-0}" = "1" ]; then
     esac
 fi
 
-# --- 4. fail fast on missing placeholders ---------------------------------------
+# --- 3. fail fast on missing placeholders ---------------------------------------
 # getGnrConfig() interpolates {GNR_*} from os.environ; a missing one fails
 # obscurely later, so check up front.
 missing=""

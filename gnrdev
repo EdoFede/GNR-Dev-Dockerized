@@ -24,6 +24,13 @@ warn() { echo "${c_ylw}warning:${c_off} $*" >&2; }
 
 [ -f .env ] || err ".env is missing — copy it from .env.example and adjust the paths"
 
+# The app runs as the host user (see docker/entrypoint.sh). Exported so compose
+# and every `exec` into app agree on it; the .env wins, the current user is the
+# fallback.
+HOST_UID=$(grep '^HOST_UID=' .env | cut -d= -f2 | tail -1 || true)
+HOST_GID=$(grep '^HOST_GID=' .env | cut -d= -f2 | tail -1 || true)
+export HOST_UID="${HOST_UID:-$(id -u)}" HOST_GID="${HOST_GID:-$(id -g)}"
+
 # Renders one help line. The command is lowercase bold green; each placeholder
 # is coloured by what it means, not by whether it is optional:
 #   <project>            cyan
@@ -76,7 +83,7 @@ usage() {
     help_line restart  "<project>[.svc]"      "restart a service (default: app)"
     help_line rm       "<project>"            "remove containers, volumes and config"
     help_line ls       ""                     "list projects and their status"
-    help_line rebuild  "<project>"            "rebuild the image"
+    help_line pull     "<project>"            "update the official image"
     help_line network  "<create|rm|list>"     "manage shared networks"
 
     printf '\n%s\n' "${c_bold}${c_ylw}DEVELOPMENT${c_off}"
@@ -100,8 +107,7 @@ usage() {
   ${c_grn}new${c_off}       --network ${c_cyan}<name>${c_off}    attach to a shared network, creating it if needed
             --framework-local   framework from the host checkout
             --framework-git ${c_cyan}<ref>${c_off}  framework cloned at that branch/commit
-  ${c_grn}up${c_off}        --build             force an image rebuild
-            --no-dbmigrate      skip schema creation on first start
+  ${c_grn}up${c_off}        --no-dbmigrate      skip schema creation on first start
             --network ${c_cyan}<name>${c_off}    force a network for this run (.env untouched)
             --framework-local   ${c_dim}|${c_off} these override the .env for this
             --framework-git ${c_cyan}<ref>${c_off}  ${c_dim}|${c_off} run only, without changing it
@@ -113,7 +119,7 @@ usage() {
             --yes, -y           do not ask for confirmation
 EOF
 
-    printf '\n%s\n' "${c_cyan}<project>${c_off}${c_mag}[.svc]${c_off}${c_dim} targets one container: app, db (also init-perms,"
+    printf '\n%s\n' "${c_cyan}<project>${c_off}${c_mag}[.svc]${c_off}${c_dim} targets one container: app, db (also debugbridge,"
     printf '%s\n' "fwgit). Example: ./gnrdev logs sandbox.app -f${c_off}"
     printf '\n%s\n' "${c_dim}Ports: web from 9000, debug from 9100, same offset per project."
     printf '%s\n' "Projects sharing a network reach each other on internal ports by name:"
@@ -141,6 +147,10 @@ env_get() {
 exec_tty_flag() {
     [ -t 1 ] || printf -- '-T'
 }
+
+# `exec` into app runs as root by default (the image user): anything it wrote
+# into the bind mounts would be root-owned on Linux. Always use the app user.
+APP_USER=(-u "${HOST_UID}:${HOST_GID}")
 
 # Framework mode in effect: an override from `up` wins over the project .env.
 # Values: "" (official image), "local" (host checkout), "git" (cloned ref).
@@ -391,8 +401,7 @@ cmd_new() {
 
 cmd_up() {
     local project="${1:-}"; shift || true
-    [ -n "$project" ] || err "usage: ./gnrdev up <project> [--framework-local|--framework-git <ref>|--framework-image] [--build] [--no-dbmigrate] [--network <name>]"
-    local build_args=()
+    [ -n "$project" ] || err "usage: ./gnrdev up <project> [--framework-local|--framework-git <ref>|--framework-image] [--no-dbmigrate] [--network <name>]"
     local do_dbmigrate=1
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -404,7 +413,6 @@ cmd_up() {
             --framework-git=*)
                 export GNR_FW_MODE_OVERRIDE=git GNR_FW_REF_OVERRIDE="${1#*=}"; shift ;;
             --framework-image) export GNR_FW_MODE_OVERRIDE=image; shift ;;
-            --build) build_args+=(--build); shift ;;
             --no-dbmigrate) do_dbmigrate=0; shift ;;
             # Forces the network for this run only: the .env is left untouched.
             --network) [ -n "${2:-}" ] || err "--network needs a name"
@@ -441,7 +449,7 @@ cmd_up() {
         # shellcheck disable=SC2086
         docker rm -f $stale >/dev/null 2>&1 || true
     fi
-    dc "$project" up -d ${build_args[@]+"${build_args[@]}"}
+    dc "$project" up -d
 
     local web; web=$(env_get "$project" GNR_PORT_WEB)
     local inst; inst=$(env_get "$project" GNR_INSTANCE)
@@ -474,17 +482,24 @@ split_target() {
     else
         TARGET_SERVICE="${spec#*.}"
         case "$TARGET_SERVICE" in
-            app|db|init-perms|fwgit) ;;
-            *) err "unknown service: '${TARGET_SERVICE}' (use app, db, init-perms or fwgit)" ;;
+            app|db|debugbridge|pgclient|fwgit) ;;
+            *) err "unknown service: '${TARGET_SERVICE}' (use app, db, debugbridge, pgclient or fwgit)" ;;
         esac
     fi
 }
 
-cmd_down()    { local p="${1:?usage: ./gnrdev down <project>}"; shift || true; dc "$p" down "$@"; }
+# --profile debug: otherwise down skips the debug bridge, which would then hold
+# on to the namespace of a removed app.
+cmd_down()    { local p="${1:?usage: ./gnrdev down <project>}"; shift || true; dc "$p" --profile debug down "$@"; }
 
 cmd_restart() {
     split_target "${1:?usage: ./gnrdev restart <project>[.service]}"
     dc "$TARGET_PROJECT" restart "${TARGET_SERVICE:-app}"
+    # The debug bridge stays tied to the network namespace of the app it was
+    # started with, which a restart replaces: drop it (this also ends debug mode).
+    if [ "${TARGET_SERVICE:-app}" = "app" ]; then
+        dc "$TARGET_PROJECT" rm -sf debugbridge >/dev/null 2>&1 || true
+    fi
 }
 
 cmd_logs() {
@@ -497,16 +512,21 @@ cmd_shell() {
     if [ "${TARGET_SERVICE:-app}" = "db" ]; then
         # the postgres image has no bash
         dc "$TARGET_PROJECT" exec db sh
+    elif [ "${TARGET_SERVICE:-app}" = "app" ]; then
+        dc "$TARGET_PROJECT" exec "${APP_USER[@]}" app bash
     else
-        dc "$TARGET_PROJECT" exec "${TARGET_SERVICE:-app}" bash
+        dc "$TARGET_PROJECT" exec "$TARGET_SERVICE" sh
     fi
 }
-cmd_rebuild() { local p="${1:?usage: ./gnrdev rebuild <project>}"; dc "$p" build --no-cache; }
+
+# Pulls the official image for the project's GENROPY_TAG; `up` then recreates
+# the container if the image changed.
+cmd_pull() { local p="${1:?usage: ./gnrdev pull <project>}"; dc "$p" pull app; }
 
 cmd_gnr() {
     local p="${1:?usage: ./gnrdev gnr <project> <args...>}"; shift
     local t; t=$(exec_tty_flag)
-    dc "$p" exec ${t:+$t} app gnr "$@"
+    dc "$p" exec ${t:+$t} "${APP_USER[@]}" app gnr "$@"
 }
 
 cmd_psql() {
@@ -538,9 +558,9 @@ db_cmd() {
     local inst; inst=$(env_get "$p" GNR_INSTANCE)
     local t; t=$(exec_tty_flag)
     if [ "$mode" = "check" ]; then
-        dc "$p" exec ${t:+$t} app gnr db migrate -c -v "$inst"
+        dc "$p" exec ${t:+$t} "${APP_USER[@]}" app gnr db migrate -c -v "$inst"
     else
-        dc "$p" exec ${t:+$t} app gnr db migrate -u "$inst"
+        dc "$p" exec ${t:+$t} "${APP_USER[@]}" app gnr db migrate -u "$inst"
     fi
 }
 
@@ -565,9 +585,11 @@ cmd_debug() {
     dbg=$(env_get "$p" GNR_PORT_DEBUG)
     web=$(env_get "$p" GNR_PORT_WEB)
     info "restarting ${inst} with debugpy"
-    dc "$p" exec -d app supervisorctl stop gnrserve
-    dc "$p" exec -d app supervisorctl start debugbridge
-    dc "$p" exec -d app gnr web serve "$inst" -p "$web" --debugpy
+    dc "$p" exec "${APP_USER[@]}" app \
+        supervisorctl -c /opt/gnrdev/supervisor/supervisord.conf stop gnrserve >/dev/null
+    # Recreated every time: an old bridge may point at a replaced app namespace.
+    dc "$p" up -d --no-deps --force-recreate debugbridge
+    dc "$p" exec -d "${APP_USER[@]}" app gnr web serve "$inst" -p "$web" --debugpy
     echo
     echo "Attach from your IDE to ${c_grn}localhost:${dbg}${c_off}"
     warn "autoreload is off under --debugpy: after editing run ./gnrdev restart ${p}"
@@ -616,7 +638,7 @@ cmd_rm() {
     fi
 
     info "removing containers and volumes of ${project}"
-    dc "$project" down --volumes --remove-orphans 2>&1 | grep -vE "^$" || true
+    dc "$project" --profile debug down --volumes --remove-orphans 2>&1 | grep -vE "^$" || true
     if [ "$keep_env" = "0" ]; then
         rm -f "$ef"
         info "removed ${ef}"
@@ -916,7 +938,7 @@ case "${1:-}" in
     dbmigrate) shift; cmd_dbmigrate "$@" ;;
     dbcheck) shift; cmd_dbcheck "$@" ;;
     debug)   shift; cmd_debug "$@" ;;
-    rebuild) shift; cmd_rebuild "$@" ;;
+    pull)    shift; cmd_pull "$@" ;;
     ls)      shift; cmd_ls "$@" ;;
     rm)      shift; cmd_rm "$@" ;;
     backup)  shift; cmd_backup "$@" ;;

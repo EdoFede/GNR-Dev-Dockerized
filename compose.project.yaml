@@ -35,34 +35,49 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  # Named volumes are created root-owned; without this the genro user cannot
-  # install Python packages into them. Runs as root, fixes, exits.
-  init-perms:
-    image: busybox:latest
-    container_name: gnr-${GNR_PROJECT}-init
+  # The framework itself runs psql, pg_dump and pg_restore (dump/restore in the
+  # postgres adapter), which the official image lacks. They are copied from the
+  # postgres image the db already uses, so no extra download and the client
+  # always matches the server. libpq comes along: psql 18 needs a newer one
+  # than the image has. Wrappers scope it to these tools, so psycopg is
+  # untouched. Runs on every start, so a POSTGRES_TAG change follows along.
+  pgclient:
+    image: postgres:${POSTGRES_TAG:-18}
+    container_name: gnr-${GNR_PROJECT}-pgclient
     user: "0:0"
-    command: >
-      sh -c "mkdir -p /pylibs/lib /pylibs/bin &&
-             chown -R ${HOST_UID:-501}:${HOST_GID:-20} /pylibs &&
-             echo 'permessi del volume pylibs sistemati'"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        rm -rf /pgclient/* && mkdir -p /pgclient/bin /pgclient/libexec /pgclient/lib
+        src=$$(ls -d /usr/lib/postgresql/*/bin | tail -1)
+        cp -P /usr/lib/*-linux-gnu/libpq.so.5* /pgclient/lib/
+        for t in psql pg_dump pg_restore pg_dumpall pg_isready; do
+          cp "$$src/$$t" /pgclient/libexec/
+          printf '#!/bin/sh\nLD_LIBRARY_PATH=/opt/pgclient/lib exec /opt/pgclient/libexec/%s "$$@"\n' "$$t" > "/pgclient/bin/$$t"
+          chmod 755 "/pgclient/bin/$$t"
+        done
+        echo "[pgclient] $$("$$src/psql" --version)"
     volumes:
-      - pylibs:/pylibs
+      - pgclient:/pgclient
 
   app:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.dev
-      args:
-        GENROPY_TAG: ${GENROPY_TAG:-latest}
-        HOST_UID: ${HOST_UID:-501}
-        HOST_GID: ${HOST_GID:-20}
-    image: gnrdev/${GNR_PROJECT}:${GENROPY_TAG:-latest}
+    # The official image, used as it is: everything dev-specific is mounted
+    # from docker/ and set up by the entrypoint at runtime.
+    image: ghcr.io/genropy/genropy:${GENROPY_TAG:-latest}
+    # The entrypoint starts as root (the image default), creates a user with the
+    # host uid/gid and drops to it: see docker/entrypoint.sh.
+    entrypoint: ["/opt/gnrdev/entrypoint.sh"]
+    command: ["supervisord", "-c", "/opt/gnrdev/supervisor/supervisord.conf"]
     container_name: gnr-${GNR_PROJECT}-app
     hostname: gnr-${GNR_PROJECT}-app
+    # service_healthy means pg_isready succeeds, so the app never has to wait
+    # for the database itself.
     depends_on:
       db:
         condition: service_healthy
-      init-perms:
+      pgclient:
         condition: service_completed_successfully
     environment:
       # --- project identity ---
@@ -96,20 +111,30 @@ services:
       GNR_EXTERNALHOST: ${GNR_EXTERNALHOST:-http://localhost:${GNR_PORT_WEB}}
       GNR_LOCALE: ${GNR_LOCALE:-it_IT}
 
+      # --- runtime user ---
+      # The entrypoint runs the app as this uid/gid, so whatever it writes into
+      # the bind mounts (instances, sites) belongs to the host user on Linux.
+      HOST_UID: ${HOST_UID:-501}
+      HOST_GID: ${HOST_GID:-20}
+      HOME: /home/genro
+      PYTHONUSERBASE: /home/genro/.local
+      PATH: /home/genro/.local/bin:/opt/pgclient/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+      XDG_CACHE_HOME: /home/genro/.local/.cache
+
       # --- development ---
-      # inotify events do not cross the bind mount on macOS; without forced
-      # polling Werkzeug's reloader never fires. See docker/polling_observer.py.
-      GNR_FORCE_POLLING: "1"
-      GNR_POLLING_INTERVAL: "${GNR_POLLING_INTERVAL:-1.0}"
+      # No watchdog in the image, so Werkzeug's "auto" reloader is the stat one:
+      # it polls mtimes, which works across the macOS bind mount.
       PYTHONUNBUFFERED: "1"
       # checkdep runs `pip install` without --user (gnrapp.py:1093); PIP_USER
       # redirects it to PYTHONUSERBASE, i.e. the per-project `pylibs` volume.
       PIP_USER: "1"
     volumes:
+      - ./docker:/opt/gnrdev:ro
       - ./gnrfolder:/home/genro/.gnr:ro
       - ${HOST_PROJECTS}:/home/genro/genropy_projects
       - ${HOST_GNREXTRA}:/home/genro/gnrextra_projects
       - pylibs:/home/genro/.local
+      - pgclient:/opt/pgclient:ro
     # Same port inside and out, so the URL the framework logs is the real one.
     ports:
       - "${GNR_PORT_WEB}:${GNR_PORT_WEB}"
@@ -117,6 +142,19 @@ services:
     restart: unless-stopped
     stop_grace_period: 20s
 
+  # debugpy binds to the app's loopback (serverwsgi.py:316), unreachable from
+  # the host. This sidecar shares the app's network namespace, so it sees that
+  # loopback, and forwards the port published by app (5679) to it. Started only
+  # by `gnrdev debug`; it must be recreated whenever app restarts, because it
+  # stays attached to the namespace of the old container.
+  debugbridge:
+    image: alpine/socat:latest
+    container_name: gnr-${GNR_PROJECT}-debugbridge
+    profiles: [debug]
+    network_mode: "service:app"
+    command: ["TCP-LISTEN:5679,fork,reuseaddr", "TCP:127.0.0.1:5678"]
+
 volumes:
   pgdata:
   pylibs:
+  pgclient:
