@@ -183,6 +183,12 @@ dc() {
     if [ "$(env_get "$p" GNR_PORT_DB)" = "0" ]; then
         files+=(-f compose.nodb.yaml)
     fi
+    # Before 18 the data path is different: see compose.pg-legacy.yaml.
+    # Only a leading major version counts; `latest` and the like are 18+.
+    local pgtag; pgtag=$(env_get "$p" POSTGRES_TAG)
+    case "$pgtag" in
+        [0-9]*) [ "${pgtag%%[!0-9]*}" -lt 18 ] && files+=(-f compose.pg-legacy.yaml) ;;
+    esac
     # The shared-network override only applies when a network is in effect.
     local net; net=$(net_for "$p")
     if [ -n "$net" ]; then

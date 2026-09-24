@@ -1,0 +1,12 @@
+# Applied by gnrdev when POSTGRES_TAG is below 18.
+#
+# Up to 17 the postgres image declares VOLUME /var/lib/postgresql/data. With
+# pgdata mounted one level up (as 18 requires), Docker puts an anonymous volume
+# on that path, shadowing it: the cluster lives there and every recreated db
+# container starts from an empty database. Mounting pgdata on the declared path
+# is what persists it.
+
+services:
+  db:
+    volumes: !override
+      - pgdata:/var/lib/postgresql/data

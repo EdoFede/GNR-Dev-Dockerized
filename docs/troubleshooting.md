@@ -114,8 +114,14 @@ supervisorctl but no `[unix_http_server]`, so the socket is never created and
 PostgreSQL 18 expects a single mount at `/var/lib/postgresql` and keeps the
 cluster in a `data` subdirectory; mounting `/var/lib/postgresql/data` directly
 makes it refuse to start with "There appears to be PostgreSQL data in ...
-(unused mount/volume)". The compose file mounts the volume one level up, which
-PostgreSQL 16 also accepts, so existing volumes keep working.
+(unused mount/volume)". The compose file mounts the volume one level up.
+
+Versions up to 17 are the opposite: their image declares
+`VOLUME /var/lib/postgresql/data`, so with the mount one level up Docker adds an
+anonymous volume on that path. The cluster ends up there, and every recreated
+db container starts from an empty database while the old one is left dangling.
+For a `POSTGRES_TAG` below 18, `gnrdev` adds `compose.pg-legacy.yaml`, which
+mounts the volume on `/var/lib/postgresql/data` instead.
 
 A volume initialised by 16 cannot be read by 18 regardless: upgrading
 `POSTGRES_TAG` on a project with data means `./gnrdev backup`, recreate, then
