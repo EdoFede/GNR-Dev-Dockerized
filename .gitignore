@@ -31,6 +31,7 @@ local_*.py
 .venv
 venv/
 .mypy_cache/
+.pytest_cache/
 TEST*.xml
 
 
@@ -126,6 +127,5 @@ projects/*.env
 # DB dumps
 backups/
 
-# Test runs: pytest cache, runtime dirs the test projects create when started
-.pytest_cache/
+# Test runs: runtime dirs the test projects create when started
 tests/genropy_projects/*/instances/*/site/
