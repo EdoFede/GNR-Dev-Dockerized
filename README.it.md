@@ -19,9 +19,18 @@ progetto significa aggiungere un file env, non un altro YAML.
 
 ```
 gnr-<progetto>
-├── db     postgres, volume dedicato
-└── app    gnr web daemon + gnr web serve (stesso container)
+├── db           postgres, volume dedicato
+├── pgclient     una tantum: copia psql/pg_dump/pg_restore per app
+├── app          gnr web daemon + gnr web serve (stesso container)
+└── debugbridge  solo durante il debug (vedi Debug remoto)
 ```
+
+Non viene costruita nessuna immagine. `app` usa l'immagine ufficiale
+`ghcr.io/genropy/genropy` cosi' com'e': entrypoint e configurazione di
+supervisor sono montati da `docker/`, le dipendenze Python finiscono in un
+volume per progetto, e i pochi strumenti che mancano all'immagine arrivano da
+altre immagini ufficiali. I progetti sullo stesso tag del framework condividono
+un'unica immagine su disco.
 
 Il daemon e il web server condividono il container per necessita': il client
 del site register verifica il PID del site daemon con `psutil.pid_exists()`,
@@ -31,12 +40,27 @@ che e' locale al PID namespace. Ogni progetto ha il proprio daemon grazie a
 ## Setup
 
 ```bash
-cp .env.example .env     # verifica i percorsi dei sorgenti e HOST_UID / HOST_GID
+./gnrdev setup
 ```
 
-`HOST_UID`/`HOST_GID` devono corrispondere a `id -u` / `id -g`. Contano davvero:
-il daemon scrive file di stato nella directory del sito bind-montata, e un
-ownership disallineato li rende scomodi da gestire dall'host.
+`setup` scrive il `.env` globale passo passo: la radice dei progetti, le
+directory opzionali di gnrextra e dei sorgenti Genropy, `HOST_UID`/`HOST_GID`
+(precompilati con l'utente corrente), il tag di default dell'immagine
+(`latest`) e le tre porte base. Rilancialo per cambiare la configurazione: i
+percorsi attuali vengono proposti come default e il file precedente resta in
+`.env.bak`. In alternativa si puo' copiare `.env.example` in `.env` e
+modificarlo a mano.
+
+Senza `HOST_GNREXTRA` al suo posto viene montato un volume vuoto;
+`HOST_GENROPY` serve solo ai progetti in modalita' framework-local.
+
+`HOST_UID`/`HOST_GID` devono corrispondere a `id -u` / `id -g` (se mancano,
+`gnrdev` usa l'utente corrente). L'app gira con quell'uid/gid: l'entrypoint
+parte come root, aggiunge un utente `gnrdev` con quegli id e passa a lui. Su
+Linux e' questo che mantiene scrivibile la directory dell'istanza e intestati a
+te i file che il framework ci scrive (file temporanei, stato del sito). Su macOS
+il runtime rimappa comunque l'ownership dei bind mount, quindi i valori contano
+meno.
 
 ## Uso quotidiano
 
@@ -96,7 +120,7 @@ lanciare prima `dbcheck`: il migratore NG rileva differenze che il vecchio
 ./gnrdev gnr <progetto> <args...>      # CLI gnr dentro il container
 ./gnrdev psql <progetto>               # client psql
 ./gnrdev restart <progetto>            # riavvia il servizio app
-./gnrdev rebuild <progetto>            # ricostruisce l'immagine
+./gnrdev pull <progetto>               # aggiorna l'immagine ufficiale (poi up)
 ```
 
 `logs`, `shell` e `restart` accettano anche `<progetto>.<servizio>` per agire su
@@ -109,10 +133,11 @@ un singolo container:
 ./gnrdev restart sandbox.db            # riavvia solo il database
 ```
 
-Servizi: `app`, `db` (piu' `init-perms`, `init-fwgit` e `fwgit`).
+Servizi: `app`, `db` (piu' `pgclient`, `debugbridge`, `init-fwgit` e `fwgit`).
 
 I container hanno hostname uguale al nome del container, quindi il prompt dice
-dove ti trovi: `genro@gnr-sandbox-app`.
+dove ti trovi: `gnrdev@gnr-sandbox-app`. `shell`, `gnr`, `dbcheck` e
+`dbmigrate` girano con l'utente dell'app, mai come root.
 
 ### Backup e restore
 
@@ -201,7 +226,14 @@ PostgreSQL viene pubblicato per essere raggiungibile da client esterni; con
 `GNR_PORT_DB=0` nel `.env` del progetto resta non pubblicato.
 
 L'immagine del database e' `postgres:18` di default (`POSTGRES_TAG` per
-progetto).
+progetto). Le versioni precedenti tengono i dati in un percorso diverso:
+`gnrdev` lo gestisce per qualsiasi tag inferiore a 18 (vedi
+`docs/troubleshooting.md`).
+
+Il framework stesso usa `psql`, `pg_dump` e `pg_restore`, che l'immagine
+ufficiale non ha. Il servizio una tantum `pgclient` li copia, insieme alla loro
+`libpq`, dall'immagine postgres del progetto: nessun download in piu', e il
+client ha sempre la stessa versione del server.
 
 ## Far dialogare i progetti
 
@@ -263,8 +295,9 @@ porta resta inutilizzata e puoi toglierla dal `.env` del progetto.
 Esiste come porta separata per come il framework avvia debugpy:
 `debugpy.listen(("localhost", 5678))` fa bind sul loopback del container, quindi
 pubblicare direttamente la 5678 non la renderebbe raggiungibile dall'host. Un
-ponte `socat` nel container inoltra 5679 → 5678, e `GNR_PORT_DEBUG` mappa quella
-5679.
+sidecar `socat` (`debugbridge`) condivide il network namespace dell'app, quindi
+vede quel loopback, e inoltra 5679 → 5678; `GNR_PORT_DEBUG` mappa quella 5679.
+Il sidecar gira solo durante il debug.
 
 ### Quando conviene
 
@@ -281,11 +314,11 @@ valore, una riga di log e' piu' rapida.
 ./gnrdev debug sandbox
 ```
 
-Ferma il server sotto supervisor, avvia il ponte socat e riavvia
+Ferma il server sotto supervisor, avvia il sidecar `debugbridge` e riavvia
 `gnr web serve` con `--debugpy` sulla stessa porta web. Poi attacca l'IDE alla
 porta di debug del progetto. Finche' il progetto gira cosi', `gnrdev ls` mostra
 la porta nella colonna DEBUG, e `./gnrdev restart <progetto>` lo riporta sotto
-supervisor.
+supervisor e rimuove il sidecar.
 
 `launch.json` per VS Code — il secondo mapping serve solo se vuoi entrare anche
 nel codice del framework:
@@ -318,7 +351,9 @@ Due cose da sapere:
 
 Di default il framework viene dall'immagine ufficiale, al tag indicato da
 `GENROPY_TAG` in `.env` (`latest`, `develop`, o una versione come `26.05.05`).
-Dopo averlo cambiato: `./gnrdev rebuild <progetto>`.
+Un tag nuovo viene scaricato dal primo `up`. Un tag mobile come `latest` non si
+aggiorna da solo: `./gnrdev pull <progetto>`, poi `up`. In entrambi i casi le
+dipendenze Python vengono ricontrollate al successivo avvio.
 
 Esistono altre due modalita', e un progetto puo' essere fissato su una di esse
 gia' alla creazione:
@@ -328,8 +363,8 @@ gia' alla creazione:
 ./gnrdev new <progetto> --framework-git develop  # un clone di quel branch/commit
 ```
 
-**`--framework-local`** bind-monta `HOST_GENROPY` e lo installa in editable
-mode: le modifiche al framework hanno effetto immediato. Il checkout dell'host
+**`--framework-local`** bind-monta `HOST_GENROPY`: le modifiche al framework
+hanno effetto immediato (autoreload compreso). Il checkout dell'host
 viene usato com'e', nessun comando git lo tocca. Da' accesso anche alle versioni
 di dojo assenti nell'immagine ufficiale.
 
@@ -339,10 +374,17 @@ avvio**, quindi il container resta allineato a quanto pubblicato nel repository,
 e due progetti possono stare su ref diversi senza conflitti. Con
 `GNR_FRAMEWORK_REPO` nel `.env` del progetto si punta a un altro repository.
 
-Entrambe le modalita' costruiscono un'immagine separata (`:fwsrc`) con il
-framework rimosso da `site-packages`, che altrimenti avrebbe la precedenza su
-quello montato; l'entrypoint fallisce esplicitamente se il checkout non e'
-quello realmente importato.
+Entrambe le modalita' usano la stessa immagine ufficiale. Il checkout viene
+montato sopra `/home/genro/genropy`, dove `environment.xml` cerca gia' gli
+asset statici, e il suo `gnrpy/` va in testa al `PYTHONPATH`, davanti alla copia
+installata nell'immagine. Viene anche installato in editable mode nel volume
+Python del progetto, cosi' arrivano le dipendenze che dichiara; l'installazione
+si ripete quando cambia il suo `pyproject.toml` e viene rimossa quando il
+progetto torna all'immagine. L'entrypoint fallisce esplicitamente se il
+checkout non e' quello realmente importato.
+
+L'installazione editable lascia un `genropy.egg-info` in `gnrpy/` del checkout;
+e' ignorato da git.
 
 `up` cambia la modalita' per un singolo avvio, senza toccare il `.env`:
 
@@ -369,6 +411,15 @@ Si dichiarano normalmente nella configurazione dell'istanza con
 `gnrextra_projects` sono montati interi, quindi di norma funziona senza
 configurazione aggiuntiva.
 
+Di default quegli alberi sono `HOST_PROJECTS` e `HOST_GNREXTRA` del `.env`
+globale. Un progetto puo' montarne altri impostando `GNR_PROJECTS_DIR` e
+`GNR_EXTRA_DIR` nel proprio `.env` (percorsi assoluti; vuoto = il default),
+oppure alla creazione:
+
+```bash
+./gnrdev new helloworld --projects-dir tests/genropy_projects
+```
+
 `GNR_DEP_PROJECTS` nel `.env` del progetto documenta la relazione; le dipendenze
 Python vengono risolte da `gnr app checkdep`, eseguito all'avvio del container.
 
@@ -381,9 +432,11 @@ risultare mancante pur essendo su disco.
 
 ```
 compose.project.yaml     stack per progetto (unico file parametrico)
-compose.framework.yaml   override per il framework da sorgenti
+compose.framework-*.yaml override per il framework da sorgenti (local, git)
 compose.network.yaml     override applicato quando GNR_NETWORK e' valorizzata
-docker/                  Dockerfile di sviluppo, entrypoint, config supervisor
+compose.nodb.yaml        override applicato quando GNR_PORT_DB=0
+compose.pg-legacy.yaml   override applicato quando POSTGRES_TAG e' inferiore a 18
+docker/                  entrypoint e config supervisor, montati in app
 gnrfolder/               configurazione .gnr, montata read-only nei container
 projects/<nome>.env      configurazione per progetto (non versionata)
 gnrdev                   wrapper dei comandi

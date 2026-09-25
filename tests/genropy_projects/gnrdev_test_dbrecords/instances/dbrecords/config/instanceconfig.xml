@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<GenRoBag>
+	<db dbname="dbrecords"></db>
+	<packages>
+		<gnrcore_sys pkgcode="gnrcore:sys"></gnrcore_sys>
+		<gnrcore_adm pkgcode="gnrcore:adm"></gnrcore_adm>
+		<dbrecords pkgcode="dbrecords"></dbrecords>
+	</packages>
+	<authentication pkg="dbrecords">
+		<py_auth defaultTags="user" pkg="adm" method="authenticate"></py_auth>
+	</authentication>
+	<site>
+		<wsgi mainpackage="dbrecords"></wsgi>
+	</site>
+</GenRoBag>

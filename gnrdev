@@ -4,6 +4,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Where gnrdev was launched from: `setup` resolves relative paths against it.
+CALLER_PWD="$PWD"
 cd "$ROOT"
 
 # Colours only when stdout is a terminal: redirected output stays clean.
@@ -22,7 +24,17 @@ err() { echo "${c_red}error:${c_off} $*" >&2; exit 1; }
 info() { echo "${c_grn}==>${c_off} $*"; }
 warn() { echo "${c_ylw}warning:${c_off} $*" >&2; }
 
-[ -f .env ] || err ".env is missing — copy it from .env.example and adjust the paths"
+case "${1:-}" in
+    setup|""|-h|--help|help) ;;
+    *) [ -f .env ] || err ".env is missing — run ./gnrdev setup (or copy .env.example and adjust it)" ;;
+esac
+
+# The app runs as the host user (see docker/entrypoint.sh). Exported so compose
+# and every `exec` into app agree on it; the .env wins, the current user is the
+# fallback.
+HOST_UID=$(grep '^HOST_UID=' .env 2>/dev/null | cut -d= -f2 | tail -1 || true)
+HOST_GID=$(grep '^HOST_GID=' .env 2>/dev/null | cut -d= -f2 | tail -1 || true)
+export HOST_UID="${HOST_UID:-$(id -u)}" HOST_GID="${HOST_GID:-$(id -g)}"
 
 # Renders one help line. The command is lowercase bold green; each placeholder
 # is coloured by what it means, not by whether it is optional:
@@ -70,13 +82,14 @@ usage() {
     printf '%s\n\n' "${c_bold}gnrdev${c_off} — dockerized Genropy dev environment"
 
     printf '%s\n' "${c_bold}${c_ylw}STACK${c_off}"
-    help_line new      "<project> [instance]" "create a project configuration"
+    help_line setup    ""                     "create the global .env, step by step"
+    help_line new     "<project> [instance]" "create a project configuration"
     help_line up       "<project>"            "start the stack"
     help_line down     "<project>"            "stop the stack"
     help_line restart  "<project>[.svc]"      "restart a service (default: app)"
     help_line rm       "<project>"            "remove containers, volumes and config"
     help_line ls       ""                     "list projects and their status"
-    help_line rebuild  "<project>"            "rebuild the image"
+    help_line pull     "<project>"            "update the official image"
     help_line network  "<create|rm|list>"     "manage shared networks"
 
     printf '\n%s\n' "${c_bold}${c_ylw}DEVELOPMENT${c_off}"
@@ -100,8 +113,7 @@ usage() {
   ${c_grn}new${c_off}       --network ${c_cyan}<name>${c_off}    attach to a shared network, creating it if needed
             --framework-local   framework from the host checkout
             --framework-git ${c_cyan}<ref>${c_off}  framework cloned at that branch/commit
-  ${c_grn}up${c_off}        --build             force an image rebuild
-            --no-dbmigrate      skip schema creation on first start
+  ${c_grn}up${c_off}        --no-dbmigrate      skip schema creation on first start
             --network ${c_cyan}<name>${c_off}    force a network for this run (.env untouched)
             --framework-local   ${c_dim}|${c_off} these override the .env for this
             --framework-git ${c_cyan}<ref>${c_off}  ${c_dim}|${c_off} run only, without changing it
@@ -113,7 +125,7 @@ usage() {
             --yes, -y           do not ask for confirmation
 EOF
 
-    printf '\n%s\n' "${c_cyan}<project>${c_off}${c_mag}[.svc]${c_off}${c_dim} targets one container: app, db (also init-perms,"
+    printf '\n%s\n' "${c_cyan}<project>${c_off}${c_mag}[.svc]${c_off}${c_dim} targets one container: app, db (also debugbridge,"
     printf '%s\n' "fwgit). Example: ./gnrdev logs sandbox.app -f${c_off}"
     printf '\n%s\n' "${c_dim}Ports: web from 9000, debug from 9100, same offset per project."
     printf '%s\n' "Projects sharing a network reach each other on internal ports by name:"
@@ -141,6 +153,10 @@ env_get() {
 exec_tty_flag() {
     [ -t 1 ] || printf -- '-T'
 }
+
+# `exec` into app runs as root by default (the image user): anything it wrote
+# into the bind mounts would be root-owned on Linux. Always use the app user.
+APP_USER=(-u "${HOST_UID}:${HOST_GID}")
 
 # Framework mode in effect: an override from `up` wins over the project .env.
 # Values: "" (official image), "local" (host checkout), "git" (cloned ref).
@@ -175,7 +191,12 @@ dc() {
     local files=(-f compose.project.yaml)
     local fwmode; fwmode=$(fw_mode_for "$p")
     case "$fwmode" in
-        local) files+=(-f compose.framework-local.yaml) ;;
+        local)
+            # Optional in `setup`, so it can be empty: compose would then fail
+            # on a volume spec with no source.
+            grep -q '^HOST_GENROPY=..*' .env \
+                || err "framework mode 'local' needs HOST_GENROPY in .env (the host checkout): ./gnrdev setup"
+            files+=(-f compose.framework-local.yaml) ;;
         git)   files+=(-f compose.framework-git.yaml) ;;
     esac
     # GNR_PORT_DB=0 means "do not publish": the mapping has to be dropped,
@@ -183,6 +204,12 @@ dc() {
     if [ "$(env_get "$p" GNR_PORT_DB)" = "0" ]; then
         files+=(-f compose.nodb.yaml)
     fi
+    # Before 18 the data path is different: see compose.pg-legacy.yaml.
+    # Only a leading major version counts; `latest` and the like are 18+.
+    local pgtag; pgtag=$(env_get "$p" POSTGRES_TAG)
+    case "$pgtag" in
+        [0-9]*) [ "${pgtag%%[!0-9]*}" -lt 18 ] && files+=(-f compose.pg-legacy.yaml) ;;
+    esac
     # The shared-network override only applies when a network is in effect.
     local net; net=$(net_for "$p")
     if [ -n "$net" ]; then
@@ -231,6 +258,29 @@ next_free_slot() {
     err "no free slot in ranges ${web_base}+ / ${debug_base}+ / ${db_base}+"
 }
 
+# Source of the framework in a running app, from the mount over
+# /home/genro/genropy: "local" (bind, host checkout), "git" (named volume),
+# "image" (no mount).
+fw_mount_mode() {
+    local t
+    t=$(docker inspect "gnr-${1}-app" --format \
+        '{{range .Mounts}}{{if eq .Destination "/home/genro/genropy"}}{{.Type}}{{end}}{{end}}' 2>/dev/null)
+    case "$t" in
+        bind)   echo local ;;
+        volume) echo git ;;
+        *)      echo image ;;
+    esac
+}
+
+# Branch (or short commit when detached) of the mounted framework. The
+# checkout belongs to the host user, not to the exec user: safe.directory
+# keeps git from refusing it as "dubious ownership".
+fw_mount_ref() {
+    local git=(docker exec "gnr-${1}-app" git -c safe.directory='*' -C /home/genro/genropy)
+    { "${git[@]}" symbolic-ref --short -q HEAD || "${git[@]}" rev-parse --short HEAD; } \
+        2>/dev/null | tr -d "\r" | tail -1 || true
+}
+
 # Describes the framework a running project is actually using, reading the
 # container rather than the .env: an override passed to `up` must show here.
 #   image (<tag>)     from the official image
@@ -248,17 +298,14 @@ fw_runtime_desc() {
         esac
         return 0
     fi
-    # The mount is present only in local/git mode.
-    if ! docker exec "$c" test -d /home/genro/framework 2>/dev/null; then
+    local mode ref; mode=$(fw_mount_mode "$p")
+    if [ "$mode" = "image" ]; then
         local tag; tag=$(docker inspect "$c" --format '{{.Config.Image}}' 2>/dev/null | sed 's|.*:||')
         echo "image (${tag:-latest})"
         return 0
     fi
-    local ref
-    ref=$(docker exec "$c" sh -c 'cd /home/genro/framework 2>/dev/null &&
-              { git symbolic-ref --short -q HEAD || git rev-parse --short HEAD; } 2>/dev/null' 2>/dev/null | tr -d "\r" | tail -1)
-    # A bind mount shows the host device; a named volume does not.
-    if docker inspect "$c" --format '{{range .Mounts}}{{if eq .Destination "/home/genro/framework"}}{{.Type}}{{end}}{{end}}' 2>/dev/null | grep -q bind; then
+    ref=$(fw_mount_ref "$p")
+    if [ "$mode" = "local" ]; then
         [ -n "$ref" ] && echo "local (${ref})" || echo "local"
     else
         [ -n "$ref" ] && echo "git ${ref}" || echo "git"
@@ -274,33 +321,335 @@ fw_is_override() {
 
     local want; want=$(env_get "$p" GNR_FRAMEWORK_MODE)
     [ -n "$want" ] || want="image"
-
-    local actual="image"
-    if docker exec "$c" test -d /home/genro/framework 2>/dev/null; then
-        if docker inspect "$c" --format '{{range .Mounts}}{{if eq .Destination "/home/genro/framework"}}{{.Type}}{{end}}{{end}}' 2>/dev/null | grep -q bind; then
-            actual="local"
-        else
-            actual="git"
-        fi
-    fi
+    local actual; actual=$(fw_mount_mode "$p")
     [ "$actual" != "$want" ] && return 0
 
     # Same mode: in git mode the ref may still differ.
     if [ "$actual" = "git" ]; then
         local want_ref; want_ref=$(env_get "$p" GNR_FRAMEWORK_REF)
-        local has_ref
-        has_ref=$(docker exec "$c" sh -c 'cd /home/genro/framework 2>/dev/null &&
-                      { git symbolic-ref --short -q HEAD || git rev-parse --short HEAD; } 2>/dev/null' 2>/dev/null | tr -d "\r" | tail -1)
-        [ -n "$want_ref" ] && [ "$want_ref" != "$has_ref" ] && return 0
+        [ -n "$want_ref" ] && [ "$want_ref" != "$(fw_mount_ref "$p")" ] && return 0
     fi
     return 1
 }
 
+# ---------------------------------------------------------------- setup
+# Interactive writer of the global .env. Values of an existing .env are offered
+# as defaults (except uid/gid, tag and ports, which follow the spec below), and
+# the old file is kept as .env.bak.
+
+SETUP_STEPS=6
+
+# Readline counts every byte of the prompt as visible: escape sequences must be
+# wrapped in \001..\002 or line editing misplaces the cursor.
+rl() { [ -n "$c_off" ] && printf '\001%s\002' "$1"; return 0; }
+
+setup_banner() {
+    local title="gnrdev setup" sub="global configuration  →  .env"
+    local line="──────────────────────────────────────────────"
+    printf '\n  %s\n' "${c_teal}╭${line}╮${c_off}"
+    printf '  %s  %s%*s%s\n' "${c_teal}│${c_off}" "${c_bold}${title}${c_off}" \
+        $(( ${#line} - ${#title} - 2 )) "" "${c_teal}│${c_off}"
+    printf '  %s  %s%*s%s\n' "${c_teal}│${c_off}" "${c_dim}${sub}${c_off}" \
+        $(( ${#line} - ${#sub} - 2 )) "" "${c_teal}│${c_off}"
+    printf '  %s\n' "${c_teal}╰${line}╯${c_off}"
+    printf '  %s\n' "${c_dim}Press Enter to accept the value in [brackets], Ctrl-C to quit.${c_off}"
+}
+
+# Step header: "[n/6] Title" followed by dimmed explanation lines.
+setup_step() {
+    local n="$1" title="$2" line; shift 2
+    printf '\n%s %s\n' "${c_bold}${c_mag}[${n}/${SETUP_STEPS}]${c_off}" "${c_bold}${title}${c_off}"
+    for line in "$@"; do printf '      %s\n' "${c_dim}${line}${c_off}"; done
+}
+
+setup_ok()   { printf '      %s %s\n' "${c_grn}✓${c_off}" "$*"; }
+setup_nope() { printf '      %s %s\n' "${c_red}✗${c_off}" "$*"; }
+
+# setup_ask <var> <label> [default]: one line into <var>, Enter keeps the default.
+setup_ask() {
+    local __var="$1" label="$2" def="${3:-}" __reply prompt
+    prompt="  $(rl "$c_teal")?$(rl "$c_off") ${label}"
+    [ -n "$def" ] && prompt="${prompt} $(rl "$c_dim")[$(rl "$c_off")$(rl "$c_cyan")${def}$(rl "$c_off")$(rl "$c_dim")]$(rl "$c_off")"
+    prompt="${prompt}: "
+    # -e: readline, so paths get Tab completion.
+    IFS= read -r -e -p "$prompt" __reply || { echo; err "setup aborted: no input"; }
+    # Trim surrounding blanks.
+    __reply="${__reply#"${__reply%%[![:space:]]*}"}"
+    __reply="${__reply%"${__reply##*[![:space:]]}"}"
+    [ -n "$__reply" ] || __reply="$def"
+    printf -v "$__var" '%s' "$__reply"
+}
+
+# setup_confirm <label> <y|n>: yes/no question, the default in capitals.
+setup_confirm() {
+    local label="$1" def="$2" reply hint
+    [ "$def" = "y" ] && hint="Y/n" || hint="y/N"
+    while :; do
+        setup_ask reply "${label} $(rl "$c_dim")(${hint})$(rl "$c_off")"
+        case "${reply:-$def}" in
+            y|Y|yes|YES|Yes) return 0 ;;
+            n|N|no|NO|No)    return 1 ;;
+            *) setup_nope "answer y or n" ;;
+        esac
+    done
+}
+
+# Absolute form of a path answer: ~ expanded, relative paths taken from the
+# directory gnrdev was launched from.
+setup_abspath() {
+    local p="$1"
+    case "$p" in
+        "~")   p="$HOME" ;;
+        "~/"*) p="${HOME}/${p#\~/}" ;;
+    esac
+    case "$p" in
+        /*) ;;
+        *) p="${CALLER_PWD}/${p}" ;;
+    esac
+    echo "$p"
+}
+
+# setup_ask_dir <var> <label> <default> <required 0|1>
+# Optional directories are skipped with an empty answer (or "-" when a default
+# is offered). A missing required directory can be created on the spot.
+setup_ask_dir() {
+    local __var="$1" label="$2" def="$3" required="$4" __ans abs
+    while :; do
+        setup_ask __ans "$label" "$def"
+        if [ -z "$__ans" ] || { [ "$required" = "0" ] && [ "$__ans" = "-" ]; }; then
+            if [ "$required" = "1" ]; then
+                setup_nope "this directory is required"
+                continue
+            fi
+            printf -v "$__var" '%s' ""
+            printf '      %s\n' "${c_dim}– skipped${c_off}"
+            return 0
+        fi
+        # The .env is read both by compose and by `source`: keep it plain.
+        case "$__ans" in
+            *'"'*|*'$'*|*'`'*|*'\'*|*"'"*)
+                setup_nope "quotes, \$, \\ and backticks are not supported in paths"
+                continue ;;
+        esac
+        abs=$(setup_abspath "$__ans")
+        if [ ! -d "$abs" ]; then
+            if [ -e "$abs" ]; then
+                setup_nope "${abs} is not a directory"
+                continue
+            fi
+            if [ "$required" = "1" ] && setup_confirm "${abs} does not exist. Create it?" y; then
+                mkdir -p "$abs" || { setup_nope "could not create ${abs}"; continue; }
+            else
+                setup_nope "${abs} does not exist"
+                continue
+            fi
+        fi
+        abs=$(cd "$abs" && pwd)
+        printf -v "$__var" '%s' "$abs"
+        setup_ok "${c_cyan}${abs}${c_off}"
+        return 0
+    done
+}
+
+# setup_ask_num <var> <label> <default> <min> <max>
+setup_ask_num() {
+    local __var="$1" label="$2" def="$3" min="$4" max="$5" __n
+    while :; do
+        setup_ask __n "$label" "$def"
+        case "$__n" in
+            ''|*[!0-9]*) setup_nope "a number is required" ; continue ;;
+        esac
+        __n=$((10#$__n))
+        if [ "$__n" -lt "$min" ] || [ "$__n" -gt "$max" ]; then
+            setup_nope "must be between ${min} and ${max}"
+            continue
+        fi
+        printf -v "$__var" '%s' "$__n"
+        return 0
+    done
+}
+
+# Value of a key in a dotenv file, surrounding quotes removed (empty if absent).
+dotenv_get() {
+    local v
+    v=$(grep "^${2}=" "$1" 2>/dev/null | cut -d= -f2- | tail -1 || true)
+    v="${v%\"}"; v="${v#\"}"
+    echo "$v"
+}
+
+# Paths with blanks are quoted: both compose and `source` read them back fine.
+dotenv_val() {
+    case "$1" in
+        *[[:space:]]*) printf '"%s"' "$1" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+cmd_setup() {
+    [ $# -eq 0 ] || err "setup takes no arguments (got: $*)"
+    [ -t 0 ] || err "setup is interactive: run it from a terminal"
+
+    setup_banner
+
+    local old=""
+    if [ -f .env ]; then
+        old=".env"
+        printf '\n  %s %s\n' "${c_ylw}!${c_off}" \
+            "An existing ${c_bold}.env${c_off} was found: its paths are offered as defaults."
+        printf '    %s\n' "${c_dim}It is kept as .env.bak when the new one is written.${c_off}"
+    fi
+
+    # Five-digit ports minus the 100 slots a range spans (see next_free_slot).
+    local port_min=1024 port_max=65435
+
+    # --- 1. projects
+    local projects
+    setup_step 1 "Genropy projects directory" \
+        "Root of your Genropy projects on this machine (HOST_PROJECTS)," \
+        "mounted in the container as /home/genro/genropy_projects." \
+        "e.g. ${HOME}/Documents/Genropy/genropy_projects"
+    setup_ask_dir projects "Projects root" "$(dotenv_get "$old" HOST_PROJECTS)" 1
+
+    # --- 2. gnrextra
+    local extra extra_def
+    extra_def=$(dotenv_get "$old" HOST_GNREXTRA)
+    setup_step 2 "gnrextra directory ${c_dim}(optional)${c_off}" \
+        "Extra packages shared by projects (HOST_GNREXTRA)." \
+        "$([ -n "$extra_def" ] && echo "Enter keeps the current one, '-' leaves it unset." \
+                               || echo "Enter to skip: an empty volume is mounted instead.")"
+    setup_ask_dir extra "gnrextra directory" "$extra_def" 0
+
+    # --- 3. framework checkout
+    local genropy genropy_def
+    genropy_def=$(dotenv_get "$old" HOST_GENROPY)
+    setup_step 3 "Local Genropy sources ${c_dim}(optional)${c_off}" \
+        "A genropy checkout (HOST_GENROPY), used by projects in framework-local" \
+        "mode. Without it projects can't run the framework from a local repository." \
+        "$([ -n "$genropy_def" ] && echo "Enter keeps the current one, '-' leaves it unset." \
+                                 || echo "Enter to skip.")"
+    setup_ask_dir genropy "Genropy sources" "$genropy_def" 0
+
+    # --- 4. identity
+    local uid gid
+    setup_step 4 "Container user" \
+        "The app runs with these ids, so files it writes in the bind mounts" \
+        "stay yours. Prefilled with the current user ($(id -un))."
+    setup_ask_num uid "UID" "$(id -u)" 0 4294967294
+    setup_ask_num gid "GID" "$(id -g)" 0 4294967294
+    setup_ok "${c_cyan}${uid}:${gid}${c_off}"
+
+    # --- 5. image tag
+    local tag
+    setup_step 5 "Genropy image tag" \
+        "Default tag of the official image: latest, develop, or a version such" \
+        "as 26.05.05. Each project can still override it."
+    while :; do
+        setup_ask tag "Image tag" "latest"
+        if printf '%s' "$tag" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+            setup_ok "${c_cyan}${tag}${c_off}"
+            break
+        fi
+        setup_nope "not a valid Docker tag (letters, digits, '.', '_', '-')"
+    done
+
+    # --- 6. ports
+    local web dbg dbp
+    web=$(dotenv_get .env.example GNR_PORT_WEB_BASE);   web="${web:-9000}"
+    dbg=$(dotenv_get .env.example GNR_PORT_DEBUG_BASE); dbg="${dbg:-9100}"
+    dbp=$(dotenv_get .env.example GNR_PORT_DB_BASE);    dbp="${dbp:-9200}"
+    setup_step 6 "Port allocation" \
+        "Every project gets the same offset in three ranges, so the last digits" \
+        "pair its ports (first project ${web}/${dbg}/${dbp}, next $((web+1))/$((dbg+1))/$((dbp+1)), ...)."
+    printf '      %-8s %s\n' "web"   "${c_cyan}${web}${c_off}${c_dim}+${c_off}" \
+                                "debug" "${c_cyan}${dbg}${c_off}${c_dim}+${c_off}" \
+                                "db"    "${c_cyan}${dbp}${c_off}${c_dim}+${c_off}"
+    if setup_confirm "Customize the base ports?" n; then
+        local a b ok
+        # Proposed again after an overlap: re-offering the rejected values
+        # would recreate it with a plain Enter.
+        local web0="$web" dbg0="$dbg" dbp0="$dbp"
+        while :; do
+            setup_ask_num web "Web base port"      "$web" "$port_min" "$port_max"
+            setup_ask_num dbg "Debug base port"    "$dbg" "$port_min" "$port_max"
+            setup_ask_num dbp "Database base port" "$dbp" "$port_min" "$port_max"
+            # Each range spans 100 ports: overlapping ranges would hand the
+            # same port to two projects.
+            ok=1
+            for a in "$web:$dbg" "$web:$dbp" "$dbg:$dbp"; do
+                b=$(( ${a%:*} - ${a#*:} )); [ "$b" -lt 0 ] && b=$(( -b ))
+                [ "$b" -lt 100 ] && ok=0
+            done
+            [ "$ok" = "1" ] && break
+            setup_nope "the ranges overlap: keep the bases at least 100 apart"
+            web="$web0" dbg="$dbg0" dbp="$dbp0"
+        done
+    fi
+    setup_ok "web ${c_cyan}${web}${c_off}  debug ${c_cyan}${dbg}${c_off}  db ${c_cyan}${dbp}${c_off}"
+
+    # --- summary
+    local none="${c_dim}(not set)${c_off}" extra_s genropy_s
+    extra_s="${c_cyan}${extra}${c_off}";     [ -n "$extra" ]   || extra_s="$none"
+    genropy_s="${c_cyan}${genropy}${c_off}"; [ -n "$genropy" ] || genropy_s="$none"
+    printf '\n%s\n' "${c_bold}${c_ylw}Summary${c_off}"
+    printf '  %-16s %s\n' \
+        HOST_PROJECTS "${c_cyan}${projects}${c_off}" \
+        HOST_GNREXTRA "$extra_s" \
+        HOST_GENROPY  "$genropy_s" \
+        HOST_UID/GID  "${c_cyan}${uid}:${gid}${c_off}" \
+        GENROPY_TAG   "${c_cyan}${tag}${c_off}" \
+        "port bases"  "${c_cyan}${web}${c_off} / ${c_cyan}${dbg}${c_off} / ${c_cyan}${dbp}${c_off}"
+    echo
+    if ! setup_confirm "Write ${ROOT}/.env?" y; then
+        echo "  ${c_dim}nothing written${c_off}"
+        return 1
+    fi
+
+    [ -n "$old" ] && cp .env .env.bak
+    cat > .env <<EOF
+# Global configuration, written by ./gnrdev setup (run it again to change it).
+
+# --- source trees on the host ---------------------------------------------------
+# HOST_PROJECTS and HOST_GNREXTRA are defaults: a project .env can point
+# elsewhere with GNR_PROJECTS_DIR and GNR_EXTRA_DIR.
+# HOST_GENROPY is only needed by projects in framework-local mode; without
+# HOST_GNREXTRA an empty volume is mounted.
+HOST_GENROPY=$(dotenv_val "$genropy")
+HOST_PROJECTS=$(dotenv_val "$projects")
+HOST_GNREXTRA=$(dotenv_val "$extra")
+
+# --- identity for the bind mounts -----------------------------------------------
+# Align the container user with the host one (id -u / id -g), so files the
+# daemon writes into the sitepath stay manageable.
+HOST_UID=${uid}
+HOST_GID=${gid}
+
+# --- framework version ----------------------------------------------------------
+# Official image tag: latest, develop, or a version such as 26.05.05
+GENROPY_TAG=${tag}
+
+# --- port allocation ------------------------------------------------------------
+# Three parallel ranges; \`gnrdev new\` gives a project the same offset in each,
+# so the last digits pair its web, debug and database ports
+# (first project ${web}/${dbg}/${dbp}, next $((web+1))/$((dbg+1))/$((dbp+1)), ...).
+GNR_PORT_WEB_BASE=${web}
+GNR_PORT_DEBUG_BASE=${dbg}
+GNR_PORT_DB_BASE=${dbp}
+EOF
+
+    echo
+    info "written ${c_grn}.env${c_off}${old:+ ${c_dim}(previous one in .env.bak)${c_off}}"
+    echo "    ${c_dim}next:${c_off} ./gnrdev new ${c_cyan}<project>${c_off}"
+}
+
 # ---------------------------------------------------------------- commands
 cmd_new() {
-    local project="" instance="" network="" fwmode="" fwref=""
+    local project="" instance="" network="" fwmode="" fwref="" projdir="" extradir=""
     while [ $# -gt 0 ]; do
         case "$1" in
+            --projects-dir) [ -n "${2:-}" ] || err "--projects-dir needs a path"; projdir="$2"; shift 2 ;;
+            --projects-dir=*) projdir="${1#*=}"; shift ;;
+            --extra-dir) [ -n "${2:-}" ] || err "--extra-dir needs a path"; extradir="$2"; shift 2 ;;
+            --extra-dir=*) extradir="${1#*=}"; shift ;;
             --network) [ -n "${2:-}" ] || err "--network needs a name"; network="$2"; shift 2 ;;
             --network=*) network="${1#*=}"; shift ;;
             --framework-local) fwmode="local"; shift ;;
@@ -316,14 +665,24 @@ cmd_new() {
                 fi; shift ;;
         esac
     done
-    [ -n "$project" ] || err "usage: ./gnrdev new <project> [instance] [--network <name>] [--framework-local|--framework-git <ref>]"
+    [ -n "$project" ] || err "usage: ./gnrdev new <project> [instance] [--network <name>] [--projects-dir <path>] [--extra-dir <path>] [--framework-local|--framework-git <ref>]"
     [ "$fwmode" = "git" ] && [ -z "$fwref" ] && err "--framework-git needs a branch or commit"
     local target="projects/${project}.env"
     [ -f "$target" ] && err "${target} already exists"
 
+    # Stored absolute: compose would read a bare relative path as a volume name.
+    if [ -n "$projdir" ]; then
+        [ -d "$projdir" ] || err "directory ${projdir} does not exist"
+        projdir=$(cd "$projdir" && pwd)
+    fi
+    if [ -n "$extradir" ]; then
+        [ -d "$extradir" ] || err "directory ${extradir} does not exist"
+        extradir=$(cd "$extradir" && pwd)
+    fi
+
     # shellcheck disable=SC1091
     source .env
-    local host_projects="${HOST_PROJECTS:?}"
+    local host_projects="${projdir:-${HOST_PROJECTS:?}}"
     local pdir="${host_projects}/${project}"
     [ -d "$pdir" ] || warn "directory ${pdir} does not exist on the host"
 
@@ -364,6 +723,13 @@ cmd_new() {
                       -e "s|^GNR_FRAMEWORK_REF=.*|GNR_FRAMEWORK_REF=${fwref}|" "$target"
     fi
 
+    if [ -n "$projdir" ] || [ -n "$extradir" ]; then
+        sed -i '' -e "s|^GNR_PROJECTS_DIR=.*|GNR_PROJECTS_DIR=${projdir}|" \
+                  -e "s|^GNR_EXTRA_DIR=.*|GNR_EXTRA_DIR=${extradir}|" "$target" 2>/dev/null \
+            || sed -i -e "s|^GNR_PROJECTS_DIR=.*|GNR_PROJECTS_DIR=${projdir}|" \
+                      -e "s|^GNR_EXTRA_DIR=.*|GNR_EXTRA_DIR=${extradir}|" "$target"
+    fi
+
     if [ -n "$network" ]; then
         sed -i '' "s/^GNR_NETWORK=.*/GNR_NETWORK=${network}/" "$target" 2>/dev/null \
             || sed -i "s/^GNR_NETWORK=.*/GNR_NETWORK=${network}/" "$target"
@@ -381,6 +747,8 @@ cmd_new() {
     echo "    debugpy  : ${debug}"
     echo "    database : ${dbport}"
     [ -n "$network" ] && echo "    network  : ${network}"
+    [ -n "$projdir" ] && echo "    projects : ${projdir}"
+    [ -n "$extradir" ] && echo "    extra    : ${extradir}"
     case "$fwmode" in
         local) echo "    framework: local checkout" ;;
         git)   echo "    framework: git ${fwref}" ;;
@@ -391,8 +759,7 @@ cmd_new() {
 
 cmd_up() {
     local project="${1:-}"; shift || true
-    [ -n "$project" ] || err "usage: ./gnrdev up <project> [--framework-local|--framework-git <ref>|--framework-image] [--build] [--no-dbmigrate] [--network <name>]"
-    local build_args=()
+    [ -n "$project" ] || err "usage: ./gnrdev up <project> [--framework-local|--framework-git <ref>|--framework-image] [--no-dbmigrate] [--network <name>]"
     local do_dbmigrate=1
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -404,7 +771,6 @@ cmd_up() {
             --framework-git=*)
                 export GNR_FW_MODE_OVERRIDE=git GNR_FW_REF_OVERRIDE="${1#*=}"; shift ;;
             --framework-image) export GNR_FW_MODE_OVERRIDE=image; shift ;;
-            --build) build_args+=(--build); shift ;;
             --no-dbmigrate) do_dbmigrate=0; shift ;;
             # Forces the network for this run only: the .env is left untouched.
             --network) [ -n "${2:-}" ] || err "--network needs a name"
@@ -441,7 +807,9 @@ cmd_up() {
         # shellcheck disable=SC2086
         docker rm -f $stale >/dev/null 2>&1 || true
     fi
-    dc "$project" up -d ${build_args[@]+"${build_args[@]}"}
+    # --remove-orphans: a service dropped from the compose files would otherwise
+    # keep running and hold on to the project's volumes.
+    dc "$project" up -d --remove-orphans
 
     local web; web=$(env_get "$project" GNR_PORT_WEB)
     local inst; inst=$(env_get "$project" GNR_INSTANCE)
@@ -450,6 +818,7 @@ cmd_up() {
     # 'relation "adm.adm_preference" does not exist'. Create it on first start.
     if [ "$do_dbmigrate" = "1" ] && ! db_is_ready "$project"; then
         info "empty database: creating the schema (one-off, may take a minute)"
+        wait_app_ready "$project" || warn "app setup still running after 5 minutes"
         if db_cmd "$project" apply; then
             dc "$project" restart app >/dev/null 2>&1
         else
@@ -463,6 +832,21 @@ cmd_up() {
     echo "${c_dim}    shell: ./gnrdev shell ${project}${c_off}"
 }
 
+# `up -d` returns as soon as app is started, while its entrypoint may still be
+# installing dependencies: a `gnr` command run then fails on missing modules.
+# The entrypoint ends by exec-ing supervisord, so PID 1 becoming supervisord
+# means the setup is over. Matched on its path: while the entrypoint runs,
+# PID 1 is the shell, with a bare "supervisord" among its arguments.
+wait_app_ready() {
+    local c="gnr-${1}-app" i
+    for i in $(seq 1 300); do
+        docker exec "$c" sh -c 'tr "\0" " " < /proc/1/cmdline | grep -q "bin/supervisord"' \
+            2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
 # Accepts both "project" and "project.service" (e.g. sandbox.db).
 # Sets the globals TARGET_PROJECT and TARGET_SERVICE; the latter stays empty
 # when no service was given.
@@ -474,17 +858,24 @@ split_target() {
     else
         TARGET_SERVICE="${spec#*.}"
         case "$TARGET_SERVICE" in
-            app|db|init-perms|fwgit) ;;
-            *) err "unknown service: '${TARGET_SERVICE}' (use app, db, init-perms or fwgit)" ;;
+            app|db|debugbridge|pgclient|fwgit) ;;
+            *) err "unknown service: '${TARGET_SERVICE}' (use app, db, debugbridge, pgclient or fwgit)" ;;
         esac
     fi
 }
 
-cmd_down()    { local p="${1:?usage: ./gnrdev down <project>}"; shift || true; dc "$p" down "$@"; }
+# --profile debug: otherwise down skips the debug bridge, which would then hold
+# on to the namespace of a removed app.
+cmd_down()    { local p="${1:?usage: ./gnrdev down <project>}"; shift || true; dc "$p" --profile debug down "$@"; }
 
 cmd_restart() {
     split_target "${1:?usage: ./gnrdev restart <project>[.service]}"
     dc "$TARGET_PROJECT" restart "${TARGET_SERVICE:-app}"
+    # The debug bridge stays tied to the network namespace of the app it was
+    # started with, which a restart replaces: drop it (this also ends debug mode).
+    if [ "${TARGET_SERVICE:-app}" = "app" ]; then
+        dc "$TARGET_PROJECT" rm -sf debugbridge >/dev/null 2>&1 || true
+    fi
 }
 
 cmd_logs() {
@@ -497,16 +888,21 @@ cmd_shell() {
     if [ "${TARGET_SERVICE:-app}" = "db" ]; then
         # the postgres image has no bash
         dc "$TARGET_PROJECT" exec db sh
+    elif [ "${TARGET_SERVICE:-app}" = "app" ]; then
+        dc "$TARGET_PROJECT" exec "${APP_USER[@]}" app bash
     else
-        dc "$TARGET_PROJECT" exec "${TARGET_SERVICE:-app}" bash
+        dc "$TARGET_PROJECT" exec "$TARGET_SERVICE" sh
     fi
 }
-cmd_rebuild() { local p="${1:?usage: ./gnrdev rebuild <project>}"; dc "$p" build --no-cache; }
+
+# Pulls the official image for the project's GENROPY_TAG; `up` then recreates
+# the container if the image changed.
+cmd_pull() { local p="${1:?usage: ./gnrdev pull <project>}"; dc "$p" pull app; }
 
 cmd_gnr() {
     local p="${1:?usage: ./gnrdev gnr <project> <args...>}"; shift
     local t; t=$(exec_tty_flag)
-    dc "$p" exec ${t:+$t} app gnr "$@"
+    dc "$p" exec ${t:+$t} "${APP_USER[@]}" app gnr "$@"
 }
 
 cmd_psql() {
@@ -538,9 +934,9 @@ db_cmd() {
     local inst; inst=$(env_get "$p" GNR_INSTANCE)
     local t; t=$(exec_tty_flag)
     if [ "$mode" = "check" ]; then
-        dc "$p" exec ${t:+$t} app gnr db migrate -c -v "$inst"
+        dc "$p" exec ${t:+$t} "${APP_USER[@]}" app gnr db migrate -c -v "$inst"
     else
-        dc "$p" exec ${t:+$t} app gnr db migrate -u "$inst"
+        dc "$p" exec ${t:+$t} "${APP_USER[@]}" app gnr db migrate -u "$inst"
     fi
 }
 
@@ -565,9 +961,11 @@ cmd_debug() {
     dbg=$(env_get "$p" GNR_PORT_DEBUG)
     web=$(env_get "$p" GNR_PORT_WEB)
     info "restarting ${inst} with debugpy"
-    dc "$p" exec -d app supervisorctl stop gnrserve
-    dc "$p" exec -d app supervisorctl start debugbridge
-    dc "$p" exec -d app gnr web serve "$inst" -p "$web" --debugpy
+    dc "$p" exec "${APP_USER[@]}" app \
+        supervisorctl -c /opt/gnrdev/supervisor/supervisord.conf stop gnrserve >/dev/null
+    # Recreated every time: an old bridge may point at a replaced app namespace.
+    dc "$p" up -d --no-deps --force-recreate debugbridge
+    dc "$p" exec -d "${APP_USER[@]}" app gnr web serve "$inst" -p "$web" --debugpy
     echo
     echo "Attach from your IDE to ${c_grn}localhost:${dbg}${c_off}"
     warn "autoreload is off under --debugpy: after editing run ./gnrdev restart ${p}"
@@ -616,7 +1014,7 @@ cmd_rm() {
     fi
 
     info "removing containers and volumes of ${project}"
-    dc "$project" down --volumes --remove-orphans 2>&1 | grep -vE "^$" || true
+    dc "$project" --profile debug down --volumes --remove-orphans 2>&1 | grep -vE "^$" || true
     if [ "$keep_env" = "0" ]; then
         rm -f "$ef"
         info "removed ${ef}"
@@ -905,6 +1303,7 @@ cmd_ls() {
 }
 
 case "${1:-}" in
+    setup)   shift; cmd_setup "$@" ;;
     new)     shift; cmd_new "$@" ;;
     up)      shift; cmd_up "$@" ;;
     down)    shift; cmd_down "$@" ;;
@@ -916,7 +1315,7 @@ case "${1:-}" in
     dbmigrate) shift; cmd_dbmigrate "$@" ;;
     dbcheck) shift; cmd_dbcheck "$@" ;;
     debug)   shift; cmd_debug "$@" ;;
-    rebuild) shift; cmd_rebuild "$@" ;;
+    pull)    shift; cmd_pull "$@" ;;
     ls)      shift; cmd_ls "$@" ;;
     rm)      shift; cmd_rm "$@" ;;
     backup)  shift; cmd_backup "$@" ;;

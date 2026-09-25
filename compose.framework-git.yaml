@@ -70,26 +70,19 @@ services:
         echo "[fwgit] now at $$(git rev-parse --short HEAD) ($$REF)"
 
   app:
-    # Same image as --framework-local: the framework is removed from
-    # site-packages so it cannot shadow the mounted one.
-    image: gnrdev/${GNR_PROJECT}:fwsrc
-    build:
-      args:
-        FRAMEWORK_FROM_SRC: "1"
     depends_on:
-      db:
-        condition: service_healthy
-      init-perms:
-        condition: service_completed_successfully
       fwgit:
         condition: service_completed_successfully
     volumes:
-      - ./gnrfolder:/home/genro/.gnr:ro
-      - ${HOST_PROJECTS}:/home/genro/genropy_projects
-      - ${HOST_GNREXTRA}:/home/genro/gnrextra_projects
-      - fwgit:/home/genro/framework
-      - pylibs:/home/genro/.local
+      # Over the image copy, as in --framework-local. nocopy: Docker would
+      # otherwise seed an empty volume with the image's /home/genro/genropy.
+      - type: volume
+        source: fwgit
+        target: /home/genro/genropy
+        volume:
+          nocopy: true
     environment:
+      PYTHONPATH: /home/genro/genropy/gnrpy
       GNR_FRAMEWORK_EDITABLE: "1"
 
 volumes:
