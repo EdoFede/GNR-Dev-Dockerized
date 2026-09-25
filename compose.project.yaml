@@ -51,6 +51,12 @@ services:
       - -c
       - |
         set -e
+        # Debian-based tags only: Alpine ones have no *-linux-gnu libpq, and
+        # their musl binaries would not run in the app image anyway.
+        if ! ls /usr/lib/*-linux-gnu/libpq.so.5 >/dev/null 2>&1; then
+          echo "[pgclient] ERROR: POSTGRES_TAG '${POSTGRES_TAG:-18}' is not Debian-based (alpine?): use e.g. 18 or 17-bookworm" >&2
+          exit 1
+        fi
         rm -rf /pgclient/* && mkdir -p /pgclient/bin /pgclient/libexec /pgclient/lib
         src=$$(ls -d /usr/lib/postgresql/*/bin | tail -1)
         cp -P /usr/lib/*-linux-gnu/libpq.so.5* /pgclient/lib/

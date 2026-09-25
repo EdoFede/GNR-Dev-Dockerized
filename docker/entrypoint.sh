@@ -22,7 +22,8 @@ fail() { echo "[entrypoint] ERROR: $*" >&2; exit 1; }
 #
 # A passwd entry is added rather than renumbering `genro`: `usermod -u` chowns
 # the whole home, copying the framework tree into every container layer. Only
-# the two directories the user must write to are chowned, not recursively.
+# what the user must write to is handed over: the home directory itself and the
+# pylibs volume.
 # The container layer survives restarts, so every step is idempotent.
 if [ "$(id -u)" = "0" ]; then
     uid="${HOST_UID:-0}"
@@ -31,7 +32,13 @@ if [ "$(id -u)" = "0" ]; then
         getent group "$gid" >/dev/null || groupadd -g "$gid" gnrdev
         getent passwd "$uid" >/dev/null \
             || useradd -M -o -u "$uid" -g "$gid" -d /home/genro -s /bin/bash gnrdev
-        chown "$uid:$gid" /home/genro /home/genro/.local
+        chown "$uid:$gid" /home/genro
+        # The volume may hold files of another owner: seeded from the image's
+        # .local on creation, or written under a previous HOST_UID. pip --user
+        # needs all of it; only the mismatching entries are touched, so a
+        # volume already in order costs one scan.
+        find /home/genro/.local \( ! -user "$uid" -o ! -group "$gid" \) \
+            -exec chown -h "$uid:$gid" {} +
         # Loading a package's startup data unpacks startup_data.gz into a .pik
         # next to it, i.e. inside the framework tree. Only those directories
         # of the image copy are handed over: a mounted checkout (local/git
@@ -79,9 +86,13 @@ done
 # or a GENROPY_TAG change) can drop or add one, so it must re-check.
 if [ "${GNR_SKIP_CHECKDEP:-0}" != "1" ]; then
     STAMP="/home/genro/.local/.req-stamp"
+    # Asked to the interpreter the app runs on: the image may carry more than
+    # one Python under /usr/local/lib, and a new tag may move to another one.
+    PY_SITE="$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))' 2>/dev/null || true)"
     HASH="$( { find /home/genro/genropy_projects /home/genro/gnrextra_projects \
                     -maxdepth 4 -name requirements.txt -exec cat {} + 2>/dev/null || true; \
-               ls /usr/local/lib/python3.11/site-packages; \
+               python3 --version 2>&1 || true; \
+               { [ -n "${PY_SITE}" ] && ls "${PY_SITE}" 2>/dev/null; } || true; \
                echo "${GNR_INSTANCE}"; } | sha256sum | cut -d' ' -f1)"
     if [ "${HASH}" != "$(cat "${STAMP}" 2>/dev/null || true)" ]; then
         log "checking the Python dependencies of the instance"

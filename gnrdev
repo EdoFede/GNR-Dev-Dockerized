@@ -670,12 +670,15 @@ cmd_new() {
     local target="projects/${project}.env"
     [ -f "$target" ] && err "${target} already exists"
 
-    # Stored absolute: compose would read a bare relative path as a volume name.
+    # Relative to where gnrdev was launched, like in setup; stored absolute,
+    # since compose would read a bare relative path as a volume name.
     if [ -n "$projdir" ]; then
+        projdir=$(setup_abspath "$projdir")
         [ -d "$projdir" ] || err "directory ${projdir} does not exist"
         projdir=$(cd "$projdir" && pwd)
     fi
     if [ -n "$extradir" ]; then
+        extradir=$(setup_abspath "$extradir")
         [ -d "$extradir" ] || err "directory ${extradir} does not exist"
         extradir=$(cd "$extradir" && pwd)
     fi
@@ -792,6 +795,12 @@ cmd_up() {
             *)     info "framework: official image (${c_dim}.env unchanged${c_off})" ;;
         esac
     fi
+    # pgclient copies the client tools out of the postgres image into the app
+    # one, which is Debian-based: an Alpine image has neither the same paths
+    # nor binaries that would run there.
+    case "$(env_get "$project" POSTGRES_TAG)" in
+        *alpine*) err "POSTGRES_TAG must be a Debian-based tag (e.g. 18, 17-bookworm), not alpine" ;;
+    esac
     if [ "$fwmode" = "git" ] && [ -z "$(fw_ref_for "$project")" ]; then
         err "framework mode 'git' needs a ref: set GNR_FRAMEWORK_REF in the project .env or pass --framework-git <ref>"
     fi
