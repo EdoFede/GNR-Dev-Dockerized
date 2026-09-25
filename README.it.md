@@ -54,6 +54,33 @@ modificarlo a mano.
 Senza `HOST_GNREXTRA` al suo posto viene montato un volume vuoto;
 `HOST_GENROPY` serve solo ai progetti in modalita' framework-local.
 
+### Lanciare gnrdev da qualunque directory
+
+`gnrdev` lavora sulla directory indicata da `GNRDEV_ROOT_DIR`. L'ultimo passo di
+`setup` propone di aggiungerla al profilo della shell (`~/.zshrc`;
+`~/.bash_profile` per bash su macOS, `~/.bashrc` su Linux), oppure stampa la
+riga da aggiungere a mano:
+
+```bash
+export GNRDEV_ROOT_DIR="/percorso/di/gnr-dev-dockerized"
+```
+
+Serve un nuovo terminale (o un `source` del profilo) perche' abbia effetto. Con
+la variabile impostata `gnrdev` si puo' lanciare da qualunque directory, anche
+tramite un symlink nel `PATH`:
+
+```bash
+ln -s "$GNRDEV_ROOT_DIR/gnrdev" ~/.local/bin/gnrdev
+```
+
+Senza la variabile `gnrdev` usa la directory in cui si trova: `./gnrdev` dal
+repository funziona normalmente, lanciarlo per percorso da altrove funziona con
+un warning, un symlink si ferma con un errore (i symlink non vengono seguiti).
+
+I percorsi passati da riga di comando (`setup`, `new --projects-dir`, il file di
+`backup` e `restore`) sono relativi alla directory in cui ti trovi, non al
+repository.
+
 `HOST_UID`/`HOST_GID` devono corrispondere a `id -u` / `id -g` (se mancano,
 `gnrdev` usa l'utente corrente). L'app gira con quell'uid/gid: l'entrypoint
 parte come root, aggiunge un utente `gnrdev` con quegli id e passa a lui. Su
@@ -143,7 +170,7 @@ dove ti trovi: `gnrdev@gnr-sandbox-app`. `shell`, `gnr`, `dbcheck` e
 
 ```bash
 ./gnrdev backup <progetto> [file] [--offline]
-./gnrdev restore <progetto> <file> [--yes] [--online]
+./gnrdev restore <progetto> [file] [--yes] [--online]
 ./gnrdev backups                             # elenca quelli gia' fatti
 ```
 
@@ -153,9 +180,15 @@ store e' un database a se'. Ruoli e database di servizio vengono filtrati: il
 cluster appartiene al progetto e il suo ruolo esiste gia', quindi riapplicarli
 produrrebbe solo errori durante il restore.
 
-Senza nome file il default e'
-`backups/<progetto>_YYYY-mm-dd__HH-MM-SS.sql.gz` (`.gz` viene aggiunto se lo
+Un nome file e' relativo alla directory in cui ti trovi: `gnrdev backup sandbox
+bck.sql.gz` lanciato da `~/Downloads` scrive `~/Downloads/bck.sql.gz`. Senza nome
+file il backup finisce in `backups/<progetto>_YYYY-mm-dd__HH-MM-SS.sql.gz` nel
+repository, e viene stampato il percorso completo (`.gz` viene aggiunto se lo
 ometti). `backups/` e' gitignorata.
+
+`restore` senza file elenca i backup di quel progetto presenti in `backups/`,
+ordinati per nome (quindi per data), e chiede il numero di quello da
+ripristinare.
 
 **Quiescenza dello stack.** Un restore elimina e ricrea i database, cosa che le
 connessioni aperte impedirebbero: per questo di default ferma tutti i servizi
@@ -174,15 +207,22 @@ Il restore sostituisce il contenuto del cluster, quindi chiede conferma;
 ```bash
 $ ./gnrdev backup sandbox
 ==> dumping the sandbox cluster
-==> written backups/sandbox_2026-09-23__10-03-13.sql.gz (1.1M)
+==> written /percorso/di/gnr-dev-dockerized/backups/sandbox_2026-09-23__10-03-13.sql.gz (1.1M)
 
 $ ./gnrdev backup sandbox --offline
 ==> stopping:app
 ==> dumping the sandbox cluster
 ==> restarting:app
-==> written backups/sandbox_2026-09-23__10-05-26.sql.gz (1.1M)
+==> written /percorso/di/gnr-dev-dockerized/backups/sandbox_2026-09-23__10-05-26.sql.gz (1.1M)
 
-$ ./gnrdev restore sandbox backups/sandbox_2026-09-23__10-03-13.sql.gz --yes
+$ ./gnrdev restore sandbox
+Backups of sandbox in /percorso/di/gnr-dev-dockerized/backups/:
+  1  sandbox_2026-09-23__10-03-13.sql.gz            1.1M
+  2  sandbox_2026-09-23__10-05-26.sql.gz            1.1M
+Backup to restore [1-2]: 1
+Restoring /percorso/di/gnr-dev-dockerized/backups/sandbox_2026-09-23__10-03-13.sql.gz into sandbox.
+The current content of the cluster will be replaced.
+Proceed? [y/N] y
 ==> stopping:app
 ==> restoring into sandbox
 ==> restarting:app

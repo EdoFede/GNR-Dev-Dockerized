@@ -3,10 +3,9 @@
 # Run ./gnrdev without arguments for the command list.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Where gnrdev was launched from: `setup` resolves relative paths against it.
+# Where gnrdev was launched from: paths given on the command line (setup, new,
+# backup, restore) are resolved against it.
 CALLER_PWD="$PWD"
-cd "$ROOT"
 
 # Colours only when stdout is a terminal: redirected output stays clean.
 # NO_COLOR is honoured (https://no-color.org). The $'...' form needs bash,
@@ -23,6 +22,30 @@ fi
 err() { echo "${c_red}error:${c_off} $*" >&2; exit 1; }
 info() { echo "${c_grn}==>${c_off} $*"; }
 warn() { echo "${c_ylw}warning:${c_off} $*" >&2; }
+
+# The repository gnrdev works on: GNRDEV_ROOT_DIR when set, otherwise the
+# directory holding this script. Symlinks are deliberately not followed: a
+# linked gnrdev (e.g. ~/.local/bin/gnrdev) needs the variable, which
+# `./gnrdev setup` offers to add to the shell profile.
+is_gnrdev_root() { [ -f "$1/compose.project.yaml" ] && [ -f "$1/projects/_template.env" ]; }
+if [ -n "${GNRDEV_ROOT_DIR:-}" ]; then
+    ROOT=$(cd "$GNRDEV_ROOT_DIR" 2>/dev/null && pwd) \
+        || err "GNRDEV_ROOT_DIR points to ${GNRDEV_ROOT_DIR}, which does not exist"
+    is_gnrdev_root "$ROOT" \
+        || err "GNRDEV_ROOT_DIR points to ${ROOT}, which is not a gnr-dev-dockerized checkout"
+else
+    ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    is_gnrdev_root "$ROOT" \
+        || err "cannot find the gnr-dev-dockerized directory: set GNRDEV_ROOT_DIR to its path"
+    # Launched by path from elsewhere: it works, but the variable is the
+    # supported way (setup is exempt, it is the one offering to set it).
+    case "$(pwd -P)/" in
+        "$(cd "$ROOT" && pwd -P)"/*) ;;
+        *) [ "${1:-}" = "setup" ] \
+               || warn "GNRDEV_ROOT_DIR is not set, using ${ROOT} (./gnrdev setup can set it)" ;;
+    esac
+fi
+cd "$ROOT"
 
 case "${1:-}" in
     setup|""|-h|--help|help) ;;
@@ -99,7 +122,7 @@ usage() {
 
     printf '\n%s\n' "${c_bold}${c_ylw}DATABASE${c_off}"
     help_line backup  "<project> [file]"  "dump every database to one .sql.gz"
-    help_line restore "<project> <file>"  "restore a dump into the project"
+    help_line restore "<project> [file]"  "restore a dump (no file: pick one)"
     help_line backups ""                  "list the backups taken so far"
     help_line psql    "<project>"         "psql client on the database"
 
@@ -337,7 +360,7 @@ fw_is_override() {
 # as defaults (except uid/gid, tag and ports, which follow the spec below), and
 # the old file is kept as .env.bak.
 
-SETUP_STEPS=6
+SETUP_STEPS=7
 
 # Readline counts every byte of the prompt as visible: escape sequences must be
 # wrapped in \001..\002 or line editing misplaces the cursor.
@@ -394,9 +417,9 @@ setup_confirm() {
     done
 }
 
-# Absolute form of a path answer: ~ expanded, relative paths taken from the
-# directory gnrdev was launched from.
-setup_abspath() {
+# Absolute form of a path the user typed: ~ expanded, relative paths taken
+# from the directory gnrdev was launched from.
+caller_abspath() {
     local p="$1"
     case "$p" in
         "~")   p="$HOME" ;;
@@ -431,7 +454,7 @@ setup_ask_dir() {
                 setup_nope "quotes, \$, \\ and backticks are not supported in paths"
                 continue ;;
         esac
-        abs=$(setup_abspath "$__ans")
+        abs=$(caller_abspath "$__ans")
         if [ ! -d "$abs" ]; then
             if [ -e "$abs" ]; then
                 setup_nope "${abs} is not a directory"
@@ -483,6 +506,63 @@ dotenv_val() {
         *[[:space:]]*) printf '"%s"' "$1" ;;
         *) printf '%s' "$1" ;;
     esac
+}
+
+# Shell profile that exports GNRDEV_ROOT_DIR for the user's login shell;
+# empty for shells we do not know how to configure.
+shell_profile() {
+    case "$(basename "${SHELL:-}")" in
+        zsh)  echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        bash) [ "$(uname -s)" = "Darwin" ] && echo "${HOME}/.bash_profile" \
+                                           || echo "${HOME}/.bashrc" ;;
+    esac
+}
+
+# Step 7: GNRDEV_ROOT_DIR in the shell profile, so gnrdev works from any
+# directory (also through a symlink). The line carries a marker, so running
+# setup again replaces it instead of adding another one.
+setup_shell_env() {
+    local marker="# added by gnrdev setup"
+    local line="export GNRDEV_ROOT_DIR=\"${ROOT}\"  ${marker}"
+    local profile; profile=$(shell_profile)
+    setup_step 7 "Shell environment" \
+        "GNRDEV_ROOT_DIR tells gnrdev where this directory is, so it can be" \
+        "launched from anywhere, e.g. through a symlink in your PATH."
+
+    if [ "${GNRDEV_ROOT_DIR:-}" = "$ROOT" ]; then
+        setup_ok "GNRDEV_ROOT_DIR is already ${c_cyan}${ROOT}${c_off}"
+        return 0
+    fi
+    case "$ROOT" in
+        *'"'*|*'$'*|*'`'*|*'\'*)
+            setup_nope "the path contains characters that need quoting: set GNRDEV_ROOT_DIR by hand"
+            return 0 ;;
+    esac
+
+    local manual=1
+    if [ -z "$profile" ]; then
+        setup_nope "unknown shell (${SHELL:-unset}): add the variable by hand"
+    elif grep -qs '^[[:space:]]*export[[:space:]]\{1,\}GNRDEV_ROOT_DIR=' "$profile" \
+         && ! grep -qsF "$marker" "$profile"; then
+        setup_nope "${profile} already sets GNRDEV_ROOT_DIR: update it by hand"
+    elif setup_confirm "Add GNRDEV_ROOT_DIR to ${profile}?" y; then
+        local tmp; tmp=$(mktemp)
+        { grep -vF "$marker" "$profile" 2>/dev/null || true; echo "$line"; } > "$tmp"
+        # cat, not mv: the profile may be a symlink (dotfiles repos) and
+        # keeps its permissions this way.
+        if cat "$tmp" > "$profile"; then
+            manual=0
+            setup_ok "written to ${c_cyan}${profile}${c_off}"
+            printf '      %s\n' "${c_dim}Open a new terminal, or run in this one:${c_off} source ${profile}"
+        else
+            setup_nope "could not write ${profile}"
+        fi
+        rm -f "$tmp"
+    fi
+    if [ "$manual" = "1" ]; then
+        printf '      %s\n' "${c_dim}Add this line to your shell profile, then open a new terminal:${c_off}"
+        printf '        %s\n' "export GNRDEV_ROOT_DIR=\"${ROOT}\""
+    fi
 }
 
 cmd_setup() {
@@ -638,6 +718,10 @@ EOF
 
     echo
     info "written ${c_grn}.env${c_off}${old:+ ${c_dim}(previous one in .env.bak)${c_off}}"
+
+    setup_shell_env
+
+    echo
     echo "    ${c_dim}next:${c_off} ./gnrdev new ${c_cyan}<project>${c_off}"
 }
 
@@ -673,12 +757,12 @@ cmd_new() {
     # Relative to where gnrdev was launched, like in setup; stored absolute,
     # since compose would read a bare relative path as a volume name.
     if [ -n "$projdir" ]; then
-        projdir=$(setup_abspath "$projdir")
+        projdir=$(caller_abspath "$projdir")
         [ -d "$projdir" ] || err "directory ${projdir} does not exist"
         projdir=$(cd "$projdir" && pwd)
     fi
     if [ -n "$extradir" ]; then
-        extradir=$(setup_abspath "$extradir")
+        extradir=$(caller_abspath "$extradir")
         [ -d "$extradir" ] || err "directory ${extradir} does not exist"
         extradir=$(cd "$extradir" && pwd)
     fi
@@ -1100,7 +1184,7 @@ cmd_network() {
 # One gzipped file per backup, produced by pg_dumpall: it captures every
 # database of the project cluster (Genropy multidb instances keep one database
 # per store) plus roles, so a restore rebuilds the cluster as it was.
-BACKUP_DIR="backups"
+BACKUP_DIR="${ROOT}/backups"
 
 # Stops every service of the stack except the database, remembering which ones
 # were actually running. Sets STOPPED_SERVICES for restore_services().
@@ -1132,6 +1216,44 @@ backup_default_name() {
     echo "${BACKUP_DIR}/${1}_$(date +%Y-%m-%d__%H-%M-%S).sql.gz"
 }
 
+# The default-named backups of a project in BACKUP_DIR, sorted by name (hence
+# by date). The date in the pattern keeps "sandbox" from matching the backups
+# of a "sandbox_old" project.
+project_backups() {
+    local f
+    for f in "${BACKUP_DIR}/${1}"_[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]__*.sql.gz; do
+        [ -f "$f" ] && echo "$f"
+    done
+    return 0
+}
+
+# Asks which of the project backups to restore; prints the chosen path.
+choose_backup() {
+    local project="$1" files=() f n i reply
+    while IFS= read -r f; do files+=("$f"); done < <(project_backups "$project")
+    n=${#files[@]}
+    [ "$n" -gt 0 ] || err "no backup of ${project} in ${BACKUP_DIR}/: pass the file to restore"
+    [ -t 0 ] || err "no file given: pass the file to restore"
+    echo "Backups of ${project} in ${BACKUP_DIR}/:" >&2
+    for (( i = 0; i < n; i++ )); do
+        f="${files[$i]}"
+        printf '  %s  %-46s %s\n' "${c_cyan}$(printf '%*d' ${#n} $((i + 1)))${c_off}" \
+            "$(basename "$f")" "${c_dim}$(du -h "$f" | cut -f1 | tr -d ' ')${c_off}" >&2
+    done
+    while :; do
+        printf 'Backup to restore [1-%d]: ' "$n" >&2
+        read -r reply || { echo >&2; err "aborted: no input"; }
+        case "$reply" in
+            ''|*[!0-9]*) ;;
+            *) if [ $((10#$reply)) -ge 1 ] && [ $((10#$reply)) -le "$n" ]; then
+                   echo "${files[$((10#$reply - 1))]}"
+                   return 0
+               fi ;;
+        esac
+        echo "${c_red}answer a number between 1 and ${n}${c_off}" >&2
+    done
+}
+
 cmd_backup() {
     local project="${1:-}"; shift || true
     [ -n "$project" ] || err "usage: ./gnrdev backup <project> [file]"
@@ -1148,7 +1270,13 @@ cmd_backup() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^gnr-${project}-db$" \
         || err "the database of '${project}' is not running: ./gnrdev up ${project}"
 
-    [ -n "$target" ] || target="$(backup_default_name "$project")"
+    # An explicit file is relative to where gnrdev was launched; the default
+    # name lives in the backups/ of the repository.
+    if [ -n "$target" ]; then
+        target=$(caller_abspath "$target")
+    else
+        target=$(backup_default_name "$project")
+    fi
     case "$target" in
         *.gz) ;;
         *) target="${target}.gz" ;;
@@ -1191,7 +1319,7 @@ cmd_backup() {
 
 cmd_restore() {
     local project="${1:-}"; shift || true
-    [ -n "$project" ] || err "usage: ./gnrdev restore <project> <file> [--yes]"
+    [ -n "$project" ] || err "usage: ./gnrdev restore <project> [file] [--yes]"
     local src="" assume_yes=0 online=0
     for arg in "$@"; do
         case "$arg" in
@@ -1201,9 +1329,15 @@ cmd_restore() {
             *) [ -z "$src" ] && src="$arg" || err "too many arguments: ${arg}" ;;
         esac
     done
-    [ -n "$src" ] || err "usage: ./gnrdev restore <project> <file> [--yes]"
-    [ -f "$src" ] || err "file not found: ${src}"
     env_file_for "$project" >/dev/null
+    # An explicit file is relative to where gnrdev was launched; without one,
+    # the choice is among the project backups in the repository.
+    if [ -n "$src" ]; then
+        src=$(caller_abspath "$src")
+        [ -f "$src" ] || err "file not found: ${src}"
+    else
+        src=$(choose_backup "$project")
+    fi
 
     docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^gnr-${project}-db$" \
         || err "the database of '${project}' is not running: ./gnrdev up ${project}"
