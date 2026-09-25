@@ -1263,8 +1263,10 @@ cmd_ls() {
     shopt -s nullglob
     local files=(projects/*.env)
     [ ${#files[@]} -eq 0 ] && { echo "no project configured — run ./gnrdev new <project>"; return; }
-    printf "%-16s %-15s %-9s %-9s %-10s %-8s %-12s %-22s %s\n" \
-        PROJECT INSTANCE STATUS "WEB PORT" "DEBUG PORT" "DB PORT" NETWORK FRAMEWORK URL
+    # Same style as the section titles of the help. The line is padded first
+    # and coloured as a whole, so the escapes do not upset the alignment.
+    printf "%s%-16s %-15s %-9s %-5s %-6s %-5s %-12s %-22s %s%s\n" "${c_bold}${c_ylw}" \
+        PROJECT INSTANCE STATUS WEB DEBUG DB NETWORK FRAMEWORK URL "${c_off}"
     for f in "${files[@]}"; do
         [ "$(basename "$f")" = "_template.env" ] && continue
         local p i w dbp nt st dbg
@@ -1278,7 +1280,7 @@ cmd_ls() {
         [ -n "$nt" ] || nt="-"
         # Pad the plain word first, then colour it: escape sequences have no
         # width, so padding a coloured string would misalign the columns.
-        dbg="$(printf '%-10s' '-')"
+        dbg="$(printf '%-6s' '-')"
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^gnr-${p}-app$"; then
             st="${c_grn}$(printf '%-9s' running)${c_off}"
             # Debug mode leaves a `gnr web serve ... --debugpy` running outside
@@ -1292,7 +1294,7 @@ cmd_ls() {
                     esac
                   done; exit 1' 2>/dev/null; then
                 local dport; dport=$(grep '^GNR_PORT_DEBUG=' "$f" 2>/dev/null | cut -d= -f2 || true)
-                dbg="${c_mag}$(printf '%-10s' "${dport:-on}")${c_off}"
+                dbg="${c_mag}$(printf '%-6s' "${dport:-on}")${c_off}"
             fi
         else
             st="${c_dim}$(printf '%-9s' stopped)${c_off}"
@@ -1306,7 +1308,7 @@ cmd_ls() {
         else
             fwcol="$(printf '%-22s' "$fw")"
         fi
-        printf "%-16s %-15s %s %-9s %s %-8s %-12s %s %s\n" \
+        printf "%-16s %-15s %s %-5s %s %-5s %-12s %s %s\n" \
             "$p" "$i" "$st" "$w" "$dbg" "$dbp" "$nt" "$fwcol" "http://localhost:${w}"
     done
 }
