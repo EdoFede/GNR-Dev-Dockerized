@@ -1,0 +1,13 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<GenRoBag>
+	<db dbname="version"></db>
+	<packages>
+		<version pkgcode="version"></version>
+	</packages>
+	<authentication pkg="version">
+		<py_auth defaultTags="user" pkg="adm" method="authenticate"></py_auth>
+	</authentication>
+	<site>
+		<wsgi mainpackage="version"></wsgi>
+	</site>
+</GenRoBag>

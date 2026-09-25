@@ -142,7 +142,9 @@ def project_factory():
     project do not step on each other."""
     created = []
 
-    def start(name, *up_args):
+    def start(name, *up_args, env=None):
+        """`env` adds KEY=VALUE lines to the project .env before `up`; being
+        read last, they win over what `new` wrote and over the global .env."""
         env_file = ROOT / "projects" / f"{name}.env"
         if env_file.exists():
             pytest.fail(
@@ -152,6 +154,10 @@ def project_factory():
         gnrdev("new", name, "--projects-dir", str(TEST_PROJECTS), timeout=60)
         if name not in created:
             created.append(name)
+        if env:
+            with env_file.open("a") as f:
+                f.write("\n# --- set by the tests ---\n")
+                f.writelines(f"{k}={v}\n" for k, v in env.items())
         gnrdev("up", name, *up_args)
         return env_file
 
