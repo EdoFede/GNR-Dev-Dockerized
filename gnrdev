@@ -145,7 +145,8 @@ usage() {
   ${c_grn}restore${c_off}   --online            do not stop anything (default: quiesce first)
             --yes, -y           do not ask for confirmation
   ${c_grn}rm${c_off}        --keep-env          keep the project .env
-            --yes, -y           do not ask for confirmation
+            --yes, -y           do not ask (and back up the database)
+            --no-backup         do not back up the database first
 EOF
 
     printf '\n%s\n' "${c_cyan}<project>${c_off}${c_mag}[.svc]${c_off}${c_dim} targets one container: app, db (also debugbridge,"
@@ -1066,18 +1067,43 @@ cmd_debug() {
 
 
 # ---------------------------------------------------------------- removal
+# Backup taken by `rm` before the volumes go. A stopped stack gets its database
+# started just for the dump: `rm` removes it right after anyway. A database
+# with no tables (never migrated) has nothing to save, and cmd_backup would
+# reject its almost-empty dump. Runs in a subshell, so a failed backup (err
+# exits) only fails this function.
+rm_backup() (
+    local p="$1"
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^gnr-${p}-db$"; then
+        info "starting the database of ${p} for the backup"
+        dc "$p" up -d --wait db >/dev/null 2>&1 || err "the database of '${p}' does not start"
+    fi
+    local db user tables
+    db=$(env_get "$p" GNR_DB_NAME)
+    user=$(env_get "$p" GNR_DB_USER)
+    tables=$(dc "$p" exec -T db psql -U "${user:-genro}" -d "$db" -tAc \
+        "select count(*) from pg_tables where schemaname not in ('pg_catalog', 'information_schema')" \
+        2>/dev/null | tr -d '[:space:]' || true)
+    if [ "$tables" = "0" ]; then
+        info "the database of ${p} is empty: no backup needed"
+        return 0
+    fi
+    cmd_backup "$p"
+)
+
 # Removes containers, volumes and (optionally) the project configuration.
 # The database volume goes with it, so the schema and its data are lost:
 # always show what will disappear and ask, unless --yes was given.
 cmd_rm() {
     local project="${1:-}"; shift || true
-    [ -n "$project" ] || err "usage: ./gnrdev rm <project> [--keep-env] [--yes]"
+    [ -n "$project" ] || err "usage: ./gnrdev rm <project> [--keep-env] [--yes] [--no-backup]"
     local ef; ef=$(env_file_for "$project")
-    local keep_env=0 assume_yes=0
+    local keep_env=0 assume_yes=0 no_backup=0
     for arg in "$@"; do
         case "$arg" in
-            --keep-env) keep_env=1 ;;
-            --yes|-y)   assume_yes=1 ;;
+            --keep-env)  keep_env=1 ;;
+            --yes|-y)    assume_yes=1 ;;
+            --no-backup) no_backup=1 ;;
             *) err "unknown option: ${arg}" ;;
         esac
     done
@@ -1097,6 +1123,21 @@ cmd_rm() {
     [ "$keep_env" = "0" ] && echo "  config     ${ef}"
     echo "  ${c_dim}sources on the host are never touched${c_off}"
 
+    # The database goes with the volume: unless --no-backup, it is dumped
+    # first, asking when interactive and without asking under --yes.
+    local do_backup=0
+    if [ "$no_backup" = "0" ] && echo "$vols" | grep -qx "gnr-${project}_pgdata"; then
+        if [ "$assume_yes" = "1" ]; then
+            do_backup=1
+        else
+            printf "\nBack up the database first? [Y/n] "
+            local answer; read -r answer || answer=n
+            case "$answer" in
+                ''|y|Y|yes|YES) do_backup=1 ;;
+            esac
+        fi
+    fi
+
     if [ "$assume_yes" = "0" ]; then
         printf "\nProceed? [y/N] "
         local reply; read -r reply
@@ -1104,6 +1145,11 @@ cmd_rm() {
             y|Y|yes|YES) ;;
             *) echo "aborted"; return 1 ;;
         esac
+    fi
+
+    if [ "$do_backup" = "1" ]; then
+        rm_backup "$project" \
+            || err "backup failed, nothing removed (--no-backup to remove anyway)"
     fi
 
     info "removing containers and volumes of ${project}"

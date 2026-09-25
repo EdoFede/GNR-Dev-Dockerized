@@ -3,7 +3,7 @@ tests/genropy_projects and talk to the resulting site over HTTP.
 
 These are end-to-end tests: they need Docker and create real containers.
 Set GNRDEV_TEST_KEEP=1 to leave a project running after the tests, to
-inspect it by hand (remove it later with ./gnrdev rm <project> --yes).
+inspect it by hand (remove it later with ./gnrdev rm <project> --yes --no-backup).
 """
 
 import http.cookiejar
@@ -116,8 +116,8 @@ def element_strings(element):
 
 
 def remove_project(name):
-    """./gnrdev rm: containers, volumes and .env of the project."""
-    return gnrdev("rm", name, "--yes", timeout=300)
+    """./gnrdev rm: containers, volumes and .env of the project, no backup."""
+    return gnrdev("rm", name, "--yes", "--no-backup", timeout=300)
 
 
 def project_leftovers(name):
@@ -149,7 +149,7 @@ def project_factory():
         if env_file.exists():
             pytest.fail(
                 f"{env_file.relative_to(ROOT)} already exists: the tests create it "
-                f"from scratch. Remove it first with ./gnrdev rm {name} --yes"
+                f"from scratch. Remove it first with ./gnrdev rm {name} --yes --no-backup"
             )
         gnrdev("new", name, "--projects-dir", str(TEST_PROJECTS), timeout=60)
         if name not in created:
@@ -167,4 +167,4 @@ def project_factory():
         return
     for name in created:
         if project_leftovers(name):
-            gnrdev("rm", name, "--yes", timeout=300, check=False)
+            gnrdev("rm", name, "--yes", "--no-backup", timeout=300, check=False)

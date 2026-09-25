@@ -234,12 +234,20 @@ Proceed? [y/N] y
 ```bash
 ./gnrdev rm <progetto>                 # chiede conferma
 ./gnrdev rm <progetto> --keep-env      # rimuove i container, tiene la config
-./gnrdev rm <progetto> --yes           # senza conferma
+./gnrdev rm <progetto> --yes           # senza conferma, backup automatico
+./gnrdev rm <progetto> --yes --no-backup   # senza conferma, senza backup
 ```
 
 Elenca cosa sparira' prima di chiedere. Il volume del database e' incluso,
 quindi schema e dati vanno persi; i sorgenti sull'host non vengono mai toccati.
 Con `--keep-env` la configurazione sopravvive e `up` ricrea lo stack da zero.
+
+Prima di rimuovere, `rm` propone un backup del database (default si'); con
+`--yes` lo fa senza chiedere. Il dump finisce in `backups/` come con
+`./gnrdev backup`, e se lo stack e' fermo il database viene avviato solo per
+questo. Un database senza tabelle (mai migrato) non viene salvato: non c'e'
+niente da tenere. Se il backup fallisce non viene rimosso niente. `--no-backup`
+lo salta.
 
 ## Porte
 
