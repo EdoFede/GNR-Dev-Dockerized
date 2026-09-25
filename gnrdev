@@ -1154,6 +1154,14 @@ cmd_rm() {
 
     info "removing containers and volumes of ${project}"
     dc "$project" --profile debug down --volumes --remove-orphans 2>&1 | grep -vE "^$" || true
+    # `down --volumes` only removes the volumes of the compose files loaded
+    # now: one from an override the project no longer uses (fwgit, after going
+    # back to the image) would survive. Compose labels every volume it creates
+    # with the project, so remove what is left by label.
+    local leftover
+    for leftover in $(docker volume ls -q --filter "label=com.docker.compose.project=gnr-${project}"); do
+        docker volume rm "$leftover" >/dev/null && echo " Volume ${leftover} Removed"
+    done
     if [ "$keep_env" = "0" ]; then
         rm -f "$ef"
         info "removed ${ef}"

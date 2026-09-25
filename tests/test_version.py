@@ -14,7 +14,8 @@ import re
 
 import pytest
 
-from conftest import ROOT, GenropySite, gnrdev, read_env
+from conftest import (ROOT, GenropySite, gnrdev, project_leftovers, read_env,
+                      remove_project)
 
 PROJECT = "gnrdev_test_version"
 PAGE = "/version.py"
@@ -89,3 +90,11 @@ def test_framework_local_runs_the_host_checkout(site):
         pytest.skip("no local framework: HOST_GENROPY not set or not a genropy checkout")
     up("--framework-local")
     assert framework_info(site)["genropy_version"] == expected
+
+
+def test_rm_removes_the_volumes_of_every_mode(env):
+    """The git mode left its fwgit volume behind; back on the image, rm has to
+    remove it all the same."""
+    up("--framework-image")
+    remove_project(PROJECT)
+    assert project_leftovers(PROJECT) == [], "rm left something behind"
