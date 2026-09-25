@@ -39,8 +39,18 @@ there is no shared daemon coupling projects together.
 ## Setup
 
 ```bash
-cp .env.example .env     # check source paths and HOST_UID / HOST_GID
+./gnrdev setup
 ```
+
+`setup` writes the global `.env` step by step: the projects root, the optional
+gnrextra and Genropy source directories, `HOST_UID`/`HOST_GID` (prefilled with
+the current user), the default image tag (`latest`) and the three base ports.
+Run it again to change the configuration: the current paths are offered as
+defaults and the previous file is kept as `.env.bak`. Copying `.env.example`
+to `.env` and editing it by hand works too.
+
+Without `HOST_GNREXTRA` an empty volume is mounted in its place;
+`HOST_GENROPY` is only needed by projects in framework-local mode.
 
 `HOST_UID`/`HOST_GID` should match `id -u` / `id -g` (when missing, `gnrdev`
 uses the current user). The app runs as that uid/gid: the entrypoint starts as

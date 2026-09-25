@@ -40,8 +40,19 @@ che e' locale al PID namespace. Ogni progetto ha il proprio daemon grazie a
 ## Setup
 
 ```bash
-cp .env.example .env     # verifica i percorsi dei sorgenti e HOST_UID / HOST_GID
+./gnrdev setup
 ```
+
+`setup` scrive il `.env` globale passo passo: la radice dei progetti, le
+directory opzionali di gnrextra e dei sorgenti Genropy, `HOST_UID`/`HOST_GID`
+(precompilati con l'utente corrente), il tag di default dell'immagine
+(`latest`) e le tre porte base. Rilancialo per cambiare la configurazione: i
+percorsi attuali vengono proposti come default e il file precedente resta in
+`.env.bak`. In alternativa si puo' copiare `.env.example` in `.env` e
+modificarlo a mano.
+
+Senza `HOST_GNREXTRA` al suo posto viene montato un volume vuoto;
+`HOST_GENROPY` serve solo ai progetti in modalita' framework-local.
 
 `HOST_UID`/`HOST_GID` devono corrispondere a `id -u` / `id -g` (se mancano,
 `gnrdev` usa l'utente corrente). L'app gira con quell'uid/gid: l'entrypoint
