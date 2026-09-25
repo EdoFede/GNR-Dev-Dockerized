@@ -400,6 +400,15 @@ Si dichiarano normalmente nella configurazione dell'istanza con
 `gnrextra_projects` sono montati interi, quindi di norma funziona senza
 configurazione aggiuntiva.
 
+Di default quegli alberi sono `HOST_PROJECTS` e `HOST_GNREXTRA` del `.env`
+globale. Un progetto puo' montarne altri impostando `GNR_PROJECTS_DIR` e
+`GNR_EXTRA_DIR` nel proprio `.env` (percorsi assoluti; vuoto = il default),
+oppure alla creazione:
+
+```bash
+./gnrdev new helloworld --projects-dir tests/genropy_projects
+```
+
 `GNR_DEP_PROJECTS` nel `.env` del progetto documenta la relazione; le dipendenze
 Python vengono risolte da `gnr app checkdep`, eseguito all'avvio del container.
 

@@ -391,6 +391,15 @@ Declare them as usual in the instance config with
 `pkgcode="project:package"`. The `genropy_projects` and `gnrextra_projects`
 trees are mounted whole, so this normally works with no extra configuration.
 
+Those trees default to `HOST_PROJECTS` and `HOST_GNREXTRA` from the global
+`.env`. A project can mount different ones by setting `GNR_PROJECTS_DIR` and
+`GNR_EXTRA_DIR` in its own `.env` (absolute paths; empty means the default), or
+at creation time:
+
+```bash
+./gnrdev new helloworld --projects-dir tests/genropy_projects
+```
+
 `GNR_DEP_PROJECTS` in the project `.env` documents the relationship; Python
 dependencies are resolved by `gnr app checkdep`, which runs at container start.
 

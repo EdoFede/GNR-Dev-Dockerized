@@ -125,3 +125,7 @@ projects/*.env
 
 # DB dumps
 backups/
+
+# Test runs: pytest cache, runtime dirs the test projects create when started
+.pytest_cache/
+tests/genropy_projects/*/instances/*/site/

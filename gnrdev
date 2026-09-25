@@ -323,9 +323,13 @@ fw_is_override() {
 
 # ---------------------------------------------------------------- commands
 cmd_new() {
-    local project="" instance="" network="" fwmode="" fwref=""
+    local project="" instance="" network="" fwmode="" fwref="" projdir="" extradir=""
     while [ $# -gt 0 ]; do
         case "$1" in
+            --projects-dir) [ -n "${2:-}" ] || err "--projects-dir needs a path"; projdir="$2"; shift 2 ;;
+            --projects-dir=*) projdir="${1#*=}"; shift ;;
+            --extra-dir) [ -n "${2:-}" ] || err "--extra-dir needs a path"; extradir="$2"; shift 2 ;;
+            --extra-dir=*) extradir="${1#*=}"; shift ;;
             --network) [ -n "${2:-}" ] || err "--network needs a name"; network="$2"; shift 2 ;;
             --network=*) network="${1#*=}"; shift ;;
             --framework-local) fwmode="local"; shift ;;
@@ -341,14 +345,24 @@ cmd_new() {
                 fi; shift ;;
         esac
     done
-    [ -n "$project" ] || err "usage: ./gnrdev new <project> [instance] [--network <name>] [--framework-local|--framework-git <ref>]"
+    [ -n "$project" ] || err "usage: ./gnrdev new <project> [instance] [--network <name>] [--projects-dir <path>] [--extra-dir <path>] [--framework-local|--framework-git <ref>]"
     [ "$fwmode" = "git" ] && [ -z "$fwref" ] && err "--framework-git needs a branch or commit"
     local target="projects/${project}.env"
     [ -f "$target" ] && err "${target} already exists"
 
+    # Stored absolute: compose would read a bare relative path as a volume name.
+    if [ -n "$projdir" ]; then
+        [ -d "$projdir" ] || err "directory ${projdir} does not exist"
+        projdir=$(cd "$projdir" && pwd)
+    fi
+    if [ -n "$extradir" ]; then
+        [ -d "$extradir" ] || err "directory ${extradir} does not exist"
+        extradir=$(cd "$extradir" && pwd)
+    fi
+
     # shellcheck disable=SC1091
     source .env
-    local host_projects="${HOST_PROJECTS:?}"
+    local host_projects="${projdir:-${HOST_PROJECTS:?}}"
     local pdir="${host_projects}/${project}"
     [ -d "$pdir" ] || warn "directory ${pdir} does not exist on the host"
 
@@ -389,6 +403,13 @@ cmd_new() {
                       -e "s|^GNR_FRAMEWORK_REF=.*|GNR_FRAMEWORK_REF=${fwref}|" "$target"
     fi
 
+    if [ -n "$projdir" ] || [ -n "$extradir" ]; then
+        sed -i '' -e "s|^GNR_PROJECTS_DIR=.*|GNR_PROJECTS_DIR=${projdir}|" \
+                  -e "s|^GNR_EXTRA_DIR=.*|GNR_EXTRA_DIR=${extradir}|" "$target" 2>/dev/null \
+            || sed -i -e "s|^GNR_PROJECTS_DIR=.*|GNR_PROJECTS_DIR=${projdir}|" \
+                      -e "s|^GNR_EXTRA_DIR=.*|GNR_EXTRA_DIR=${extradir}|" "$target"
+    fi
+
     if [ -n "$network" ]; then
         sed -i '' "s/^GNR_NETWORK=.*/GNR_NETWORK=${network}/" "$target" 2>/dev/null \
             || sed -i "s/^GNR_NETWORK=.*/GNR_NETWORK=${network}/" "$target"
@@ -406,6 +427,8 @@ cmd_new() {
     echo "    debugpy  : ${debug}"
     echo "    database : ${dbport}"
     [ -n "$network" ] && echo "    network  : ${network}"
+    [ -n "$projdir" ] && echo "    projects : ${projdir}"
+    [ -n "$extradir" ] && echo "    extra    : ${extradir}"
     case "$fwmode" in
         local) echo "    framework: local checkout" ;;
         git)   echo "    framework: git ${fwref}" ;;
