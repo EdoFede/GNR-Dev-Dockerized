@@ -107,8 +107,9 @@ services:
       PIP_USER: "1"
     volumes:
       - ./gnrfolder:/home/genro/.gnr:ro
-      - ${HOST_PROJECTS}:/home/genro/genropy_projects
-      - ${HOST_GNREXTRA}:/home/genro/gnrextra_projects
+      # Per-project trees when set in the project .env, the global ones otherwise.
+      - ${GNR_PROJECTS_DIR:-${HOST_PROJECTS}}:/home/genro/genropy_projects
+      - ${GNR_EXTRA_DIR:-${HOST_GNREXTRA}}:/home/genro/gnrextra_projects
       - pylibs:/home/genro/.local
     # Same port inside and out, so the URL the framework logs is the real one.
     ports:
