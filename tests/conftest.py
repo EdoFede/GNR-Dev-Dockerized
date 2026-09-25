@@ -115,10 +115,31 @@ def element_strings(element):
         yield from node.attrib.values()
 
 
-@pytest.fixture(scope="session")
+def remove_project(name):
+    """./gnrdev rm: containers, volumes and .env of the project."""
+    return gnrdev("rm", name, "--yes", timeout=300)
+
+
+def project_leftovers(name):
+    """What is still around of a project after its removal: containers,
+    volumes and the .env. Empty when the tool cleaned up everything."""
+    def docker_names(*cmd):
+        out = subprocess.run(["docker", *cmd], capture_output=True, text=True).stdout
+        return [n for n in out.split() if n.startswith((f"gnr-{name}-", f"gnr-{name}_"))]
+
+    leftovers = docker_names("ps", "-a", "--format", "{{.Names}}")
+    leftovers += docker_names("volume", "ls", "--format", "{{.Name}}")
+    env_file = ROOT / "projects" / f"{name}.env"
+    if env_file.exists():
+        leftovers.append(str(env_file.relative_to(ROOT)))
+    return leftovers
+
+
+@pytest.fixture(scope="module")
 def project_factory():
     """Creates and starts projects from tests/genropy_projects; removes them
-    (containers, volumes, .env) at the end of the session."""
+    (containers, volumes, .env) at the end of the module, so modules sharing a
+    project do not step on each other."""
     created = []
 
     def start(name, *up_args):
@@ -129,7 +150,8 @@ def project_factory():
                 f"from scratch. Remove it first with ./gnrdev rm {name} --yes"
             )
         gnrdev("new", name, "--projects-dir", str(TEST_PROJECTS), timeout=60)
-        created.append(name)
+        if name not in created:
+            created.append(name)
         gnrdev("up", name, *up_args)
         return env_file
 
@@ -138,4 +160,5 @@ def project_factory():
     if os.environ.get("GNRDEV_TEST_KEEP") == "1":
         return
     for name in created:
-        gnrdev("rm", name, "--yes", timeout=300, check=False)
+        if project_leftovers(name):
+            gnrdev("rm", name, "--yes", timeout=300, check=False)
