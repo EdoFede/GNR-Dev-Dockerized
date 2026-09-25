@@ -32,19 +32,22 @@ match an unrelated process in the new container.
 
 ## Autoreload
 
-inotify events do not cross the bind mount from macOS, and Werkzeug hardcodes
-`reloader_type="auto"` (`gnr/web/serverwsgi.py:411`), which selects the inotify
-observer.
+Werkzeug hardcodes `reloader_type="auto"` (`gnr/web/serverwsgi.py:411`): the
+watchdog reloader when `watchdog` is importable, the stat (polling) one
+otherwise. The official image has no `watchdog`, but `gnrcore/sys` requires it
+(`attachment_uploader.py`), so `checkdep` installs it and the watchdog reloader
+is the one in use.
 
-`docker/polling_observer.py`, installed as a `.pth`, swaps
-`watchdog.observers.Observer` for the `PollingObserver` when
-`GNR_FORCE_POLLING=1`. A `.pth` runs on every interpreter start, so it also
-covers the children the reloader spawns.
+It relies on inotify, and on OrbStack inotify events do cross the bind mount
+from macOS: creating, editing and deleting a file on the host each trigger a
+reload, for project and framework code alike. Earlier versions of this
+environment forced watchdog's `PollingObserver` through a `.pth` patch; it is
+no longer needed and was dropped with the dev image.
 
-Measured on OrbStack: `stat` over 28k files takes ~0.2s, negligible.
-`GNR_POLLING_INTERVAL` (default 1.0s) tunes the frequency.
+Not verified on Docker Desktop. If edits there do not reload, the stat reloader
+is the fallback to reach for: it polls mtimes, which are always correct.
 
-`--debugpy` disables autoreload (`serverwsgi.py:316`) — correct, since the
+`--debugpy` disables autoreload (`serverwsgi.py:312`) — correct, since the
 reloader forks and would drop the attach.
 
 ## Read-only environment.xml
@@ -78,18 +81,69 @@ The port cannot be set through `GNR_WSGI_OPT_PORT`: `dictExtract`
 (`gnr/web/serverwsgi.py:294`) compares against `port`, so the env override never
 applies. Hence the CLI argument.
 
-## Volume permissions
+## Running the official image unchanged
 
-Named volumes are created root-owned while processes run as `genro`. The
-`init-perms` service fixes `pylibs` before `app` starts.
+No image is built: `app` runs `ghcr.io/genropy/genropy` as published, and what
+the old dev image added is provided at runtime.
+
+| Need | Provided by |
+|---|---|
+| entrypoint, supervisor config | `docker/` mounted read-only on `/opt/gnrdev` |
+| host uid/gid | the entrypoint, see below |
+| Python dependencies | `checkdep` into the per-project `pylibs` volume |
+| `psql`, `pg_dump`, `pg_restore` | the `pgclient` service, see below |
+| debugpy bridge | the `debugbridge` sidecar |
+| waiting for the database | `depends_on: condition: service_healthy` |
+
+### Runtime user
+
+The image runs as root. The entrypoint adds a passwd entry for
+`HOST_UID`/`HOST_GID` (`gnrdev`, unless the uid already exists) and drops to it
+with `setpriv`, so on Linux the files written into the bind mounts — the
+instance's temporary files, `sitedaemon.xml`, `siteregister_data.pik` — belong
+to the host user. On macOS OrbStack maps bind-mount ownership to the host user
+whatever the container uid (verified); Docker Desktop is expected to behave the
+same, not verified.
+
+Details that matter:
+
+- A new entry, not `usermod -u genro`: `usermod` chowns the whole home, which
+  would copy the framework tree into every container's writable layer.
+- Only `/home/genro` and the `pylibs` volume root are chowned, not
+  recursively. That replaces the old `init-perms` service.
+- stdout/stderr are root-owned `0600` pipes. supervisord reopens them by path
+  (`/dev/stdout`) and gets `EACCES` once root is dropped, so the entrypoint
+  hands them to the user first.
+- Loading a package's startup data unpacks `startup_data.gz` into a `.pik`
+  next to it (`gnr/app/gnrdbo.py:157`), inside the framework tree the image owns
+  as `genro`. Those package directories are chowned; a mounted checkout is
+  never touched.
+- `docker exec` defaults to root, so `gnrdev` always passes `-u` for app.
 
 `PIP_USER=1` makes `checkdep` install into `PYTHONUSERBASE`, i.e. the
 per-project volume; without it pip would target `/usr/local` (not writable) and
-projects would share packages.
+projects would share packages. Caches go to `XDG_CACHE_HOME`, inside the same
+volume, so they survive a recreated container.
 
-`HOST_UID`/`HOST_GID` align the container user with the host one, so the files
-the daemon writes into the sitepath (`sitedaemon.xml`,
-`siteregister_data.pik`) stay manageable.
+### Dependency stamp
+
+`checkdep` is skipped when nothing changed. The stamp hashes the projects'
+`requirements.txt`, the instance name and the list of packages in the image's
+`site-packages`: a different image can drop a package the old one provided, so
+after a `pull` or a `GENROPY_TAG` change the check runs again.
+
+### PostgreSQL client tools
+
+The postgres adapter runs `psql`, `pg_dump` and `pg_restore`
+(`gnr/sql/adapters/_gnrbasepostgresadapter.py:112`) for dumps and restores; the
+official image has none of them and logs `DB adapter required executables not
+found`. The `pgclient` service copies them from `postgres:${POSTGRES_TAG}` —
+already on disk for the db — into a volume mounted on `/opt/pgclient`.
+
+`libpq` comes along: psql 18 needs symbols the image's `libpq` lacks
+(`PQfullProtocolVersion`). Wrapper scripts set `LD_LIBRARY_PATH` for these tools
+only, so psycopg keeps its own. A client from the server's own image also means
+`pg_dump` is never older than the server, which it refuses to dump.
 
 ## Backups
 
@@ -107,7 +161,9 @@ so the containers come back even on failure or Ctrl-C.
 The image's `/etc/supervisor/supervisord.conf` declares `serverurl` for
 supervisorctl but no `[unix_http_server]`, so the socket is never created and
 `supervisorctl` cannot reach supervisord — which `gnrdev debug` relies on.
-`docker/supervisor/supervisord.conf` replaces it and adds the section.
+`docker/supervisor/supervisord.conf` is used instead (the image's file is left
+alone: it also includes `conf.d/genropy.conf`, a bare `gnr web daemon`) and
+adds the section. `gnrdev` points `supervisorctl` at it with `-c`.
 
 ## PostgreSQL 18 data path
 
@@ -132,25 +188,35 @@ A volume initialised by 16 cannot be read by 18 regardless: upgrading
 The official image installs the framework into
 `/usr/local/lib/python3.11/site-packages/gnr`, non-editable. That path is
 searched before the editable finder, so an editable install of the mounted
-checkout is not enough: `pip list` reports the checkout while `import gnr` still
-loads the image copy — silently, with framework edits having no effect.
+checkout alone is not enough: `pip list` reports the checkout while
+`import gnr` still loads the image copy — silently, with framework edits having
+no effect.
 
-The directory is therefore removed at **build time** (`FRAMEWORK_FROM_SRC=1` in
-`Dockerfile.dev`), since `site-packages` is not writable by the `genro` user at
-runtime; the same build replaces `/home/genro/genropy` with a symlink to
-`/home/genro/framework`, so the static assets declared in `environment.xml`
-come from the same tree as the Python code. Both source modes tag that image
-`:fwsrc`, so projects on the official image never reuse it.
+Instead of removing that copy (which needed a build, since `site-packages` is
+not writable at runtime), the checkout is put ahead of it:
 
-`/home/genro/framework` is the single mount point: `compose.framework-local.yaml`
-bind-mounts the host checkout there, `compose.framework-git.yaml` mounts a
-per-project volume that the `fwgit` service clones and re-checks-out at every
-start.
+- It is mounted over `/home/genro/genropy`: a bind mount of the host checkout
+  in `compose.framework-local.yaml`, the per-project `fwgit` volume (with
+  `nocopy`) in `compose.framework-git.yaml`. `environment.xml` already points
+  there for the static assets, so they follow the checkout too.
+- Its `gnrpy/` is set as `PYTHONPATH`, which comes before `site-packages`.
+- It is still installed editable into `pylibs`
+  (`pip install --user -e gnrpy[developer,pgsql]`, the installation guide
+  profiles): that brings in the dependencies it declares and metadata matching
+  its version. The stamp is the hash of `pyproject.toml`, so a ref with other
+  dependencies reinstalls.
 
-The install follows the installation guide profiles:
-`pip install --user -e <checkout>/gnrpy[developer,pgsql]`. The entrypoint then
-verifies that `import gnr` really resolves inside the checkout and fails loudly
-if it does not.
+pip runs with `PYTHONPATH` unset. Otherwise it sees the `genropy.egg-info`
+setuptools leaves in `gnrpy/` as one more installed genropy and tries to remove
+the image's copy, failing with `Permission denied: '/usr/local/bin/gnr'`.
+
+Going back to the image framework, the entrypoint uninstalls the editable
+install: the user site comes before `site-packages`, so its metadata would
+otherwise shadow the image's.
+
+The entrypoint verifies that `import gnr` really resolves inside the checkout
+and fails loudly if it does not. `gnrdev ls` tells the modes apart by the mount
+on `/home/genro/genropy`: bind is local, volume is git, none is the image.
 
 ## Colours through `docker compose exec`
 
@@ -186,9 +252,12 @@ the volumes, so nothing is lost.
   `GNR_LOCAL_PROJECTS` (`gnr/app/pathresolver.py:61`).
 - The image ships no `siteconfig/`, so there is no reload/debug until we provide
   one.
-- It ships `watchgod` but not `watchdog`.
-- `debugpy.listen` binds to `localhost` (`serverwsgi.py:320`), so publishing the
-  port is not enough — hence the `socat` bridge.
+- It runs as root.
+- It ships `watchgod` but not `watchdog`, and no `psql`/`pg_dump`/`pg_restore`.
+- `debugpy.listen` binds to `localhost` (`serverwsgi.py:316`), so publishing the
+  port is not enough — hence the `socat` sidecar, which shares the app's network
+  namespace. It stays attached to the namespace of the container it started
+  with, so `restart` and `down` remove it.
 - Python 3.11; the framework requires >= 3.11.
 - `GNR_WSGI_OPT_*` does not work for wsgi options: see the port section.
 - Its `supervisord.conf` has no `[unix_http_server]`: see above.
@@ -210,6 +279,10 @@ proposes `CREATE SCHEMA "sabdbox"`. Check with `./gnrdev dbcheck` first.
 **The app does not answer right after `up`** — the first start installs
 dependencies and builds resources. Follow `./gnrdev logs <project> -f`.
 
-**Edits have no effect** — check polling is active: `./gnrdev shell <project>`
-then `python3 -c "import watchdog.observers as o; print(o.Observer.__name__)"`,
-which must print `_TunedPollingObserver`.
+**Edits have no effect** — look for `Started server` lines in
+`./gnrdev logs <project>.app -f` after saving. None on Docker Desktop points to
+inotify events not crossing the bind mount: see Autoreload.
+
+**`Permission denied` writing inside `/home/genro/genropy`** — the framework
+wrote somewhere in its own tree other than the `startup_data` directories the
+entrypoint hands over. Add that path to the entrypoint's chown list.
